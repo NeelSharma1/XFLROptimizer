@@ -1,6 +1,6 @@
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import Revamped_XFLRPlaneScript as application
 from xflr5_core import XFLRGuiError
@@ -46,6 +46,30 @@ class FakeParent:
             elif key == "auto_id":
                 result = [control for control in result if control.auto_id == expected]
         return result
+
+
+class FakeWindow:
+    def __init__(self, process_id, title, visible=True):
+        self._process_id = process_id
+        self._title = title
+        self._visible = visible
+
+    def is_visible(self):
+        return self._visible
+
+    def process_id(self):
+        return self._process_id
+
+    def window_text(self):
+        return self._title
+
+
+class FakeDesktop:
+    def __init__(self, *windows):
+        self._windows = list(windows)
+
+    def windows(self):
+        return self._windows
 
 
 class WindowsUiAutomationTests(unittest.TestCase):
@@ -98,6 +122,53 @@ class WindowsUiAutomationTests(unittest.TestCase):
 
         self.assertIs(result, sentinel)
         constructor.assert_called_once_with(Path("project.xfl"), executable_path=Path("xflr5.exe"))
+
+    def test_existing_xflr5_is_found_by_process_name_without_an_executable_path(self):
+        main_window = FakeWindow(1234, "Project")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._desktop = FakeDesktop(main_window)
+
+        with patch("xflr5_windows_gui._windows_process_name", return_value="xflr5.exe"):
+            result = adapter._find_existing_xflr5()
+
+        self.assertEqual(result, (1234, main_window, "Project"))
+
+    def test_existing_xflr5_can_be_found_from_accessible_title(self):
+        main_window = FakeWindow(1234, "XFLR5 - Project")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._desktop = FakeDesktop(main_window)
+
+        with patch("xflr5_windows_gui._windows_process_name", return_value="qtapp.exe"):
+            result = adapter._find_existing_xflr5()
+
+        self.assertEqual(result, (1234, main_window, "XFLR5 - Project"))
+
+    def test_multiple_running_xflr5_processes_are_rejected(self):
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._desktop = FakeDesktop(
+            FakeWindow(1234, "XFLR5 - One"),
+            FakeWindow(5678, "XFLR5 - Two"),
+        )
+
+        with patch("xflr5_windows_gui._windows_process_name", return_value="xflr5.exe"):
+            with self.assertRaisesRegex(XFLRGuiError, "Multiple XFLR5 processes"):
+                adapter._find_existing_xflr5()
+
+    def test_connect_attaches_to_existing_pid_without_starting_or_using_a_path(self):
+        main_window = FakeWindow(1234, "XFLR5 - Project")
+        app = Mock()
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+
+        with patch("xflr5_windows_gui.Desktop", return_value=FakeDesktop(main_window)), patch(
+            "xflr5_windows_gui.Application", return_value=app
+        ), patch("xflr5_windows_gui._windows_xflr5_process_ids", return_value=(1234,)), patch(
+            "xflr5_windows_gui._windows_process_name", return_value="xflr5.exe"
+        ), patch("xflr5_windows_gui._windows_process_is_elevated", return_value=False):
+            adapter._connect(None, timeout=5.0)
+
+        app.connect.assert_called_once_with(process=1234, timeout=5.0)
+        app.start.assert_not_called()
+        self.assertIs(adapter._main, main_window)
 
 
 if __name__ == "__main__":

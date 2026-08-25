@@ -13,8 +13,13 @@ hard error rather than a guess.
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import subprocess
+import sys
 import time
 from typing import Any, Callable, Iterable
 
@@ -57,6 +62,193 @@ class WindowsPlaneRef:
 
 class _UiaAmbiguousError(XFLRGuiError):
     """Internal distinction between an absent and an ambiguous control."""
+
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_QUERY = 0x0008
+_TOKEN_ELEVATION = 20
+_ELEVATION_RESTART_ENV = "XFLR5_UIA_ELEVATION_RESTART"
+
+
+class _TokenElevation(ctypes.Structure):
+    _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+
+def _windows_process_name(process_id: int) -> str:
+    """Return a process image name without asking the user for its path."""
+
+    if os.name != "nt":
+        return ""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, process_id)
+    if not handle:
+        return ""
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return Path(buffer.value[: size.value]).name
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_process_is_elevated(process_id: int) -> bool:
+    """Read a process token's elevation state using the Windows API."""
+
+    if os.name != "nt":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    process_handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, process_id)
+    if not process_handle:
+        return False
+    token_handle = wintypes.HANDLE()
+    try:
+        if not advapi32.OpenProcessToken(process_handle, _TOKEN_QUERY, ctypes.byref(token_handle)):
+            return False
+        elevation = _TokenElevation()
+        size = wintypes.DWORD()
+        if not advapi32.GetTokenInformation(
+            token_handle,
+            _TOKEN_ELEVATION,
+            ctypes.byref(elevation),
+            ctypes.sizeof(elevation),
+            ctypes.byref(size),
+        ):
+            return False
+        return bool(elevation.TokenIsElevated)
+    finally:
+        if token_handle:
+            kernel32.CloseHandle(token_handle)
+        kernel32.CloseHandle(process_handle)
+
+
+def _windows_xflr5_process_ids() -> tuple[int, ...]:
+    """Find visible XFLR5 windows without requiring a UIA connection first."""
+
+    if os.name != "nt":
+        return ()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+
+    process_names: dict[int, str] = {}
+    process_ids: set[int] = set()
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @callback_type
+    def inspect_window(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        process_id_value = wintypes.DWORD()
+        if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id_value)):
+            return True
+        process_id = int(process_id_value.value)
+        if process_id not in process_names:
+            process_names[process_id] = _windows_process_name(process_id).casefold()
+        title_length = user32.GetWindowTextLengthW(hwnd)
+        title = ""
+        if title_length > 0:
+            title_buffer = ctypes.create_unicode_buffer(title_length + 1)
+            user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
+            title = title_buffer.value
+        process_name = process_names[process_id]
+        if process_name in {"xflr5.exe", "xflr5"} or "xflr5" in title.casefold():
+            process_ids.add(process_id)
+        return True
+
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.EnumWindows(inspect_window, 0)
+    return tuple(sorted(process_ids))
+
+
+def _restart_elevated() -> None:
+    """Restart this Python process elevated, then terminate the unelevated copy."""
+
+    if os.name != "nt":
+        raise XFLRGuiError("Automatic privilege elevation is only available on Windows.")
+    if os.environ.get(_ELEVATION_RESTART_ENV) == "1":
+        raise XFLRGuiError(
+            "XFLR5 is elevated, but the UI Automation process could not acquire the same privilege level."
+        )
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteW.argtypes = [
+        wintypes.HWND,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+    ]
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    previous_marker = os.environ.get(_ELEVATION_RESTART_ENV)
+    os.environ[_ELEVATION_RESTART_ENV] = "1"
+    # A normal Python launch needs the script/module path in argv. A frozen
+    # executable already contains the application, so passing argv[0] again
+    # would make it look like an input file rather than the executable itself.
+    if getattr(sys, "frozen", False) or (
+        sys.argv and Path(sys.argv[0]).resolve() == Path(sys.executable).resolve()
+    ):
+        restart_arguments = [str(argument) for argument in sys.argv[1:]]
+    else:
+        restart_arguments = [str(argument) for argument in sys.argv]
+    parameters = subprocess.list2cmdline(restart_arguments)
+    try:
+        result = shell32.ShellExecuteW(
+            None,
+            "runas",
+            sys.executable,
+            parameters,
+            str(Path.cwd()),
+            1,
+        )
+    except Exception:
+        if previous_marker is None:
+            os.environ.pop(_ELEVATION_RESTART_ENV, None)
+        else:
+            os.environ[_ELEVATION_RESTART_ENV] = previous_marker
+        raise
+    if not result or int(result) <= 32:
+        if previous_marker is None:
+            os.environ.pop(_ELEVATION_RESTART_ENV, None)
+        else:
+            os.environ[_ELEVATION_RESTART_ENV] = previous_marker
+        raise XFLRGuiError("Windows denied elevation of the UI Automation process.")
+    print("XFLR5 is elevated; restarting the automation process at the same privilege level.", flush=True)
+    os._exit(0)
 
 
 _LOCATORS: dict[str, UiaLocator] = {
@@ -168,33 +360,89 @@ class WindowsXFLRGui:
 
     # ---------- process and UIA tree helpers ----------
 
+    def _find_existing_xflr5(self) -> tuple[int, Any, str] | None:
+        """Find an already-running XFLR5 top-level UIA window by PID/name."""
+
+        candidates: dict[int, tuple[Any, str]] = {}
+        try:
+            windows = self._desktop.windows()
+        except Exception as error:
+            raise XFLRGuiError("Windows UI Automation could not enumerate the desktop windows.") from error
+        for window in windows:
+            try:
+                if not window.is_visible():
+                    continue
+                process_id = int(window.process_id())
+                title = str(window.window_text() or "").strip()
+            except Exception:
+                continue
+            process_name = _windows_process_name(process_id).casefold()
+            if process_name not in {"xflr5.exe", "xflr5"} and "xflr5" not in title.casefold():
+                continue
+            previous = candidates.get(process_id)
+            # Prefer a window whose accessible title identifies XFLR5. This
+            # avoids selecting a modal dialog when both are visible.
+            if previous is None or ("xflr5" in title.casefold() and "xflr5" not in previous[1].casefold()):
+                candidates[process_id] = (window, title)
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            details = ", ".join(f"PID {pid} ({title or 'untitled'})" for pid, (_, title) in candidates.items())
+            raise XFLRGuiError(f"Multiple XFLR5 processes are open; close one before continuing: {details}.")
+        process_id, (window, title) = next(iter(candidates.items()))
+        return process_id, window, title
+
     def _connect(self, executable_path: str | Path | None, timeout: float | None) -> None:
         self._desktop = Desktop(backend="uia")
         timeout_value = 30.0 if timeout is None else timeout
-        executable = Path(executable_path) if executable_path is not None else None
-        if executable is not None and not executable.is_file():
-            raise FileNotFoundError(executable)
 
-        self._app = Application(backend="uia")
-        if executable is not None:
-            try:
-                self._app.connect(path=str(executable), timeout=min(timeout_value, 5.0))
-            except Exception:
-                self._app = Application(backend="uia").start(str(executable))
+        # An existing process is always preferred. The optional executable
+        # path is only a launch fallback, never a prerequisite for attaching.
+        existing_process_ids = _windows_xflr5_process_ids()
+        if len(existing_process_ids) > 1:
+            details = ", ".join(str(process_id) for process_id in existing_process_ids)
+            raise XFLRGuiError(f"Multiple XFLR5 processes are open; close one before continuing (PIDs: {details}).")
+        existing = None
+        if existing_process_ids:
+            process_id = existing_process_ids[0]
+            # Do this before asking UIA for the window. A low-integrity client
+            # may not be able to enumerate an elevated window's UIA tree.
+            if _windows_process_is_elevated(process_id) and not _windows_process_is_elevated(os.getpid()):
+                _restart_elevated()
+            existing = self._find_existing_xflr5()
+            if existing is None:
+                raise XFLRGuiError(
+                    f"Found XFLR5 process {process_id}, but its top-level UIA window is not accessible."
+                )
         else:
+            # The Win32 probe can miss a hidden/nonstandard top-level window;
+            # retain the UIA title/process fallback for that case.
+            existing = self._find_existing_xflr5()
+        if existing is not None:
+            process_id, main_window, _title = existing
+            if _windows_process_is_elevated(process_id) and not _windows_process_is_elevated(os.getpid()):
+                _restart_elevated()
             try:
-                self._app.connect(title_re=self._WINDOW_TITLE_RE, timeout=timeout_value)
+                self._app = Application(backend="uia").connect(process=process_id, timeout=timeout_value)
+                self._main = main_window
+                return
             except Exception as error:
                 raise XFLRGuiError(
-                    "Could not connect to XFLR5. Start xflr5.exe first, or provide executable_path."
+                    f"Found XFLR5 process {process_id}, but could not attach to it through UI Automation."
                 ) from error
 
+        if executable_path is None:
+            raise XFLRGuiError("No running xflr5.exe process was found. Open XFLR5 before starting the optimizer.")
+        executable = Path(executable_path)
+        if not executable.is_file():
+            raise FileNotFoundError(executable)
         try:
+            self._app = Application(backend="uia").start(str(executable))
             main_spec = self._app.window(title_re=self._WINDOW_TITLE_RE)
             main_spec.wait("visible enabled ready", timeout=timeout_value)
             self._main = main_spec.wrapper_object()
         except Exception as error:
-            raise XFLRGuiError("Connected to a process, but its XFLR5 main window was not accessible.") from error
+            raise XFLRGuiError("Could not launch XFLR5 or access its main UIA window.") from error
 
     def _wait_for(
         self,
