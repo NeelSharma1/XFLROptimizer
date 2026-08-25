@@ -68,6 +68,27 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _TOKEN_QUERY = 0x0008
 _TOKEN_ELEVATION = 20
 _ELEVATION_RESTART_ENV = "XFLR5_UIA_ELEVATION_RESTART"
+_XFLR5_PROCESS_NAMES = frozenset({"xflr5.exe", "xflr5"})
+_TERMINAL_PROCESS_NAMES = frozenset(
+    {
+        "cmd.exe",
+        "conhost.exe",
+        "openconsole.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "windowsterminal.exe",
+        "wt.exe",
+    }
+)
+
+
+def _is_xflr5_process_name(process_name: str) -> bool:
+    """Return whether an image basename is the real XFLR5 process."""
+
+    normalized = process_name.casefold()
+    if normalized in _TERMINAL_PROCESS_NAMES:
+        return False
+    return normalized in _XFLR5_PROCESS_NAMES
 
 
 class _TokenElevation(ctypes.Structure):
@@ -159,10 +180,6 @@ def _windows_xflr5_process_ids() -> tuple[int, ...]:
     user32.IsWindowVisible.restype = wintypes.BOOL
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-    user32.GetWindowTextLengthW.restype = ctypes.c_int
-    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    user32.GetWindowTextW.restype = ctypes.c_int
 
     process_names: dict[int, str] = {}
     process_ids: set[int] = set()
@@ -178,14 +195,11 @@ def _windows_xflr5_process_ids() -> tuple[int, ...]:
         process_id = int(process_id_value.value)
         if process_id not in process_names:
             process_names[process_id] = _windows_process_name(process_id).casefold()
-        title_length = user32.GetWindowTextLengthW(hwnd)
-        title = ""
-        if title_length > 0:
-            title_buffer = ctypes.create_unicode_buffer(title_length + 1)
-            user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
-            title = title_buffer.value
         process_name = process_names[process_id]
-        if process_name in {"xflr5.exe", "xflr5"} or "xflr5" in title.casefold():
+        # The process image is the identity source. A terminal window can
+        # inherit an XFLR5-looking title when XFLR5 is launched from it, so a
+        # title match must never turn the terminal host into an XFLR5 PID.
+        if _is_xflr5_process_name(process_name):
             process_ids.add(process_id)
         return True
 
@@ -376,8 +390,11 @@ class WindowsXFLRGui:
                 title = str(window.window_text() or "").strip()
             except Exception:
                 continue
-            process_name = _windows_process_name(process_id).casefold()
-            if process_name not in {"xflr5.exe", "xflr5"} and "xflr5" not in title.casefold():
+            process_name = _windows_process_name(process_id)
+            # Do not identify an application from its title. Console hosts
+            # commonly display the command that launched XFLR5 in their own
+            # title bar, but their process is not the UIA target.
+            if not _is_xflr5_process_name(process_name):
                 continue
             previous = candidates.get(process_id)
             # Prefer a window whose accessible title identifies XFLR5. This

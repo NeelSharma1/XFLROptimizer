@@ -133,15 +133,39 @@ class WindowsUiAutomationTests(unittest.TestCase):
 
         self.assertEqual(result, (1234, main_window, "Project"))
 
-    def test_existing_xflr5_can_be_found_from_accessible_title(self):
+    def test_actual_xflr5_process_can_have_an_arbitrary_window_title(self):
         main_window = FakeWindow(1234, "XFLR5 - Project")
         adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
         adapter._desktop = FakeDesktop(main_window)
 
-        with patch("xflr5_windows_gui._windows_process_name", return_value="qtapp.exe"):
+        with patch("xflr5_windows_gui._windows_process_name", return_value="xflr5.exe"):
             result = adapter._find_existing_xflr5()
 
         self.assertEqual(result, (1234, main_window, "XFLR5 - Project"))
+
+    def test_terminal_host_with_an_xflr5_title_is_ignored(self):
+        terminal_window = FakeWindow(4321, "xflr5.exe")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._desktop = FakeDesktop(terminal_window)
+
+        with patch("xflr5_windows_gui._windows_process_name", return_value="conhost.exe"):
+            result = adapter._find_existing_xflr5()
+
+        self.assertIsNone(result)
+
+    def test_real_xflr5_process_is_selected_next_to_terminal_host(self):
+        terminal_window = FakeWindow(4321, "xflr5.exe")
+        xflr5_window = FakeWindow(1234, "Project")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._desktop = FakeDesktop(terminal_window, xflr5_window)
+
+        def process_name(process_id):
+            return {4321: "WindowsTerminal.exe", 1234: "xflr5.exe"}[process_id]
+
+        with patch("xflr5_windows_gui._windows_process_name", side_effect=process_name):
+            result = adapter._find_existing_xflr5()
+
+        self.assertEqual(result, (1234, xflr5_window, "Project"))
 
     def test_multiple_running_xflr5_processes_are_rejected(self):
         adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
