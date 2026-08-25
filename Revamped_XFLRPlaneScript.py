@@ -294,7 +294,7 @@ class XFLRGui:
         self,
         project_file: str | Path,
         image_directory: str | Path | None = None,
-        startup_timeout: float = 60.0,
+        startup_timeout: float | None = 300.0,
         clear_existing_polars: bool = False,
     ) -> None:
         if pg is None or pyperclip is None:
@@ -317,10 +317,23 @@ class XFLRGui:
         if clear_existing_polars:
             self.delete_polars(self.plane_location)
 
-    def _wait_for_startup(self, timeout: float) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if pg.locate(str(self.image_directory / "start.png"), pg.screenshot(), confidence=0.95):
+    def _wait_for_startup(self, timeout: float | None) -> None:
+        """Wait for the user to bring XFLR5 to the foreground.
+
+        PyAutoGUI/PyScreeze versions differ on whether a missing image returns
+        ``None`` or raises ``ImageNotFoundException``. Both outcomes mean that
+        XFLR5 is not visible yet and must keep the polling loop alive.
+        """
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        print("Waiting for XFLR5 to be visible. Switch to XFLR5 and leave its main window onscreen...")
+        while deadline is None or time.monotonic() < deadline:
+            try:
+                found = pg.locate(str(self.image_directory / "start.png"), pg.screenshot(), confidence=0.95)
+            except Exception:
+                found = None
+            if found is not None:
+                print("XFLR5 detected; continuing automation.")
                 return
             time.sleep(0.3)
         raise XFLRGuiError("Timed out waiting for XFLR5. Check display scaling and images/start.png.")
