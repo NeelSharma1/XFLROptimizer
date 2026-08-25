@@ -10,6 +10,7 @@ from Revamped_XFLRPlaneScript import (
     AircraftCandidate,
     AircraftOptimizer,
     ConstraintError,
+    convert_length,
     OptimizationConstraints,
     PlaneXmlEditor,
     XFLRGui,
@@ -19,6 +20,12 @@ from Revamped_XFLRPlaneScript import (
 
 
 class RevampedXflrTests(unittest.TestCase):
+    def test_length_conversion_uses_xml_native_units(self):
+        self.assertAlmostEqual(convert_length("5 feet", 0.0254), 60.0)
+        self.assertAlmostEqual(convert_length("1 m", 0.0254), 39.3700787402)
+        self.assertAlmostEqual(convert_length("60", 0.0254), 60.0)
+        self.assertAlmostEqual(PlaneXmlEditor.length_unit_to_meter("Main_Wing.xml"), 0.0254)
+
     def test_sweep_exposes_analysis_parameters_with_defaults(self):
         parameters = inspect.signature(XFLRGui.alpha_or_beta_sweep).parameters
         expected = {

@@ -13,6 +13,7 @@ symmetric wing, span means full tip-to-tip span (twice the largest
 from __future__ import annotations
 
 import json
+from math import isfinite
 import re
 import shutil
 import time
@@ -24,9 +25,11 @@ from typing import Callable, Iterable, Sequence
 try:
     import pyautogui as pg
     import pyperclip
-except ImportError:  # XML tests and result processing work without GUI packages.
+    _GUI_IMPORT_ERROR = None
+except Exception as error:  # XML tests and result processing work without GUI packages.
     pg = None
     pyperclip = None
+    _GUI_IMPORT_ERROR = error
 
 
 class XFLRGuiError(RuntimeError):
@@ -35,6 +38,10 @@ class XFLRGuiError(RuntimeError):
 
 class ConstraintError(ValueError):
     """Raised when a candidate violates the configured design restrictions."""
+
+
+class LengthUnitError(ValueError):
+    """Raised when a user-entered length cannot be converted."""
 
 
 @dataclass(frozen=True)
@@ -52,6 +59,9 @@ class OptimizationConstraints:
 
 @dataclass(frozen=True)
 class AnalysisSpec:
+    """Analysis inputs and their XFLR5 units."""
+
+    # Speed is m/s; all sweep and fixed angles are degrees; wait is seconds.
     speed: float = 70.0
     sweep_start: float = -13.0
     sweep_end: float = 13.0
@@ -121,8 +131,86 @@ def _safe_name(value: str) -> str:
     return safe or "candidate"
 
 
+_LENGTH_UNITS_TO_METERS = {
+    "": None,
+    "native": None,
+    "xflr": None,
+    "m": 1.0,
+    "meter": 1.0,
+    "meters": 1.0,
+    "metre": 1.0,
+    "metres": 1.0,
+    "cm": 0.01,
+    "centimeter": 0.01,
+    "centimeters": 0.01,
+    "centimetre": 0.01,
+    "centimetres": 0.01,
+    "mm": 0.001,
+    "millimeter": 0.001,
+    "millimeters": 0.001,
+    "millimetre": 0.001,
+    "millimetres": 0.001,
+    "in": 0.0254,
+    "inch": 0.0254,
+    "inches": 0.0254,
+    "ft": 0.3048,
+    "foot": 0.3048,
+    "feet": 0.3048,
+    "yd": 0.9144,
+    "yard": 0.9144,
+    "yards": 0.9144,
+}
+_LENGTH_EXPRESSION = re.compile(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)\s*$")
+
+
+def convert_length(value: str | float | int, native_length_unit_to_meter: float) -> float:
+    """Convert a user length expression to the native XFLR XML unit.
+
+    Unitless values are already native XFLR values. For example, with an XML
+    scale of ``0.0254`` metres per native unit, ``convert_length('5 feet',
+    0.0254)`` returns ``60.0``.
+    """
+
+    if native_length_unit_to_meter <= 0 or not isfinite(native_length_unit_to_meter):
+        raise LengthUnitError("The XML length-unit scale must be a finite positive number.")
+    if isinstance(value, (int, float)):
+        magnitude = float(value)
+        unit = ""
+    else:
+        match = _LENGTH_EXPRESSION.fullmatch(value)
+        if match is None:
+            raise LengthUnitError(f"Invalid length {value!r}; use forms such as '5 feet', '1.2 m', or '60'.")
+        magnitude = float(match.group(1))
+        unit = match.group(2).lower()
+    if not isfinite(magnitude):
+        raise LengthUnitError(f"Length must be finite: {value!r}.")
+    if unit not in _LENGTH_UNITS_TO_METERS:
+        supported = ", ".join(("m", "cm", "mm", "in", "ft", "yd", "native"))
+        raise LengthUnitError(f"Unsupported length unit {unit!r}; use {supported}.")
+    meters_per_unit = _LENGTH_UNITS_TO_METERS[unit]
+    return magnitude if meters_per_unit is None else magnitude * meters_per_unit / native_length_unit_to_meter
+
+
 class PlaneXmlEditor:
     """Edit XFLR-exported plane or component XML without relying on line order."""
+
+    @staticmethod
+    def length_unit_to_meter(xml_path: str | Path) -> float:
+        """Read XFLR's native length scale from an exported plane/component XML."""
+
+        tree = ET.parse(xml_path)
+        value = tree.findtext("./Units/length_unit_to_meter")
+        if value is None:
+            value = tree.findtext(".//Units/length_unit_to_meter")
+        if value is None:
+            raise LengthUnitError(f"No Units/length_unit_to_meter field was found in {xml_path}.")
+        try:
+            scale = float(value)
+        except ValueError as error:
+            raise LengthUnitError(f"Invalid XML length-unit scale {value!r} in {xml_path}.") from error
+        if scale <= 0 or not isfinite(scale):
+            raise LengthUnitError(f"XML length-unit scale must be finite and positive in {xml_path}.")
+        return scale
 
     @staticmethod
     def _wings(root: ET.Element, component_name: str | None = None) -> list[ET.Element]:
@@ -210,7 +298,11 @@ class XFLRGui:
         clear_existing_polars: bool = False,
     ) -> None:
         if pg is None or pyperclip is None:
-            raise XFLRGuiError("Install pyautogui, pyperclip and opencv-python in the active Python environment.")
+            detail = f" Original import error: {_GUI_IMPORT_ERROR}" if _GUI_IMPORT_ERROR else ""
+            raise XFLRGuiError(
+                "The GUI dependencies could not be imported. Activate the project environment and install "
+                "requirements.txt, including a Pillow version compatible with this Python version." + detail
+            )
         self.project_file = Path(project_file)
         if not self.project_file.is_file():
             raise FileNotFoundError(self.project_file)
@@ -537,17 +629,19 @@ class AircraftOptimizer:
         candidates: Iterable[AircraftCandidate],
         clear_polars_between_runs: bool = True,
         continue_on_error: bool = True,
+        baseline_path: str | Path | None = None,
     ) -> OptimizationResult:
         """Evaluate candidates and save a machine-readable checkpoint after each one."""
 
         if self.gui is None:
             raise RuntimeError("optimize() requires an XFLRGui instance.")
         result = OptimizationResult(maximize=self.maximize)
-        baseline_path = self.work_directory / "baseline_component.xml"
+        baseline_path = Path(baseline_path) if baseline_path is not None else self.work_directory / "baseline_component.xml"
         candidate_list = list(candidates)
         if not candidate_list:
             raise ValueError("No optimization candidates were supplied.")
-        self.gui.export_wing(plane, baseline_path, candidate_list[0].part)
+        if not baseline_path.is_file():
+            self.gui.export_wing(plane, baseline_path, candidate_list[0].part)
         for candidate in candidate_list:
             xml_path, result_path = self._candidate_paths(candidate)
             try:
@@ -626,6 +720,19 @@ def _prompt_float(label: str, default: float | None = None, optional: bool = Fal
             print("Enter a number, or leave it blank when the value is optional.")
 
 
+def _prompt_length(label: str, optional: bool = False) -> str | None:
+    while True:
+        value = input(f"{label}: ").strip()
+        if not value and optional:
+            return None
+        try:
+            if convert_length(value, 1.0) <= 0:
+                raise LengthUnitError("length must be positive")
+            return value
+        except LengthUnitError as error:
+            print(f"{error} Enter a value such as '5 feet', '1.5 m', or '60'.")
+
+
 def _prompt_int(label: str, default: int = 0) -> int:
     while True:
         value = _prompt_text(label, str(default))
@@ -665,6 +772,9 @@ def _interactive_settings() -> dict[str, object] | None:
 
     print("\nXFLR5 constrained aircraft optimizer")
     print("Paths may be absolute or relative to the current directory.\n")
+    print("Units: speed = m/s; sweep and fixed angles = degrees; wait time = seconds.")
+    print("Geometry lengths use the native XFLR XML unit. The supplied XML files use inches")
+    print("(0.0254 metres per unit); verify this in the selected aircraft XML before running.\n")
     project = _prompt_existing_path("XFLR5 project (.xfl)")
     foil_directory = _prompt_existing_path("Airfoil .dat directory", directory=True)
     available = sorted(airfoils_in_directory(foil_directory))
@@ -687,28 +797,34 @@ def _interactive_settings() -> dict[str, object] | None:
     plane_index = _prompt_int("Plane number (zero-based)", 0)
 
     while True:
-        span_text = input("Span values to test, comma-separated (blank = baseline only): ").strip()
+        span_text = input(
+            "Span values to test, comma-separated [native XML length units; supplied files use inches] "
+            "(blank = baseline only; units allowed, e.g. '5 feet'): "
+        ).strip()
         try:
-            spans: list[float | None] = [float(value) for value in _parse_csv_values(span_text)] or [None]
-            if all(value is None or value > 0 for value in spans):
+            spans: list[str | None] = _parse_csv_values(span_text) or [None]
+            for value in spans:
+                if value is not None and convert_length(value, 1.0) <= 0:
+                    raise LengthUnitError("length must be positive")
+            if spans:
                 break
-        except ValueError:
-            pass
-        print("Enter positive numeric span values separated by commas.")
-    span_limit = _prompt_float("Maximum full span, blank for no limit", optional=True)
-    if span_limit is not None and span_limit <= 0:
-        raise ValueError("The span limit must be positive.")
+        except LengthUnitError as error:
+            print(f"{error} Enter positive values with optional units, such as '5 feet, 20 in'.")
+    span_limit = _prompt_length(
+        "Maximum full span [native XML length units; supplied files use inches], blank for no limit",
+        optional=True,
+    )
 
     print("\nAnalysis settings")
     analysis = AnalysisSpec(
-        speed=_prompt_float("Speed", 70.0),
-        sweep_start=_prompt_float("Sweep start", -13.0),
-        sweep_end=_prompt_float("Sweep end", 13.0),
-        sweep_increment=_prompt_float("Sweep increment", 0.5),
-        fixed_angle=_prompt_float("Fixed angle", 0.0),
-        wait_seconds=_prompt_float("Seconds to wait for XFLR5", 20.0),
+        speed=_prompt_float("Speed [m/s]", 70.0),
+        sweep_start=_prompt_float("Sweep start angle [degrees]", -13.0),
+        sweep_end=_prompt_float("Sweep end angle [degrees]", 13.0),
+        sweep_increment=_prompt_float("Sweep increment [degrees]", 0.5),
+        fixed_angle=_prompt_float("Fixed angle [degrees]", 0.0),
+        wait_seconds=_prompt_float("Seconds to wait for XFLR5 [seconds]", 20.0),
     )
-    metric = _prompt_text("Metric to maximize (column or ratio such as CL/CD)", "CL/CD")
+    metric = _prompt_text("Metric to maximize (CL/CD is dimensionless)", "CL/CD")
     maximize = _prompt_yes_no("Maximize this metric?", True)
     clear_polars = _prompt_yes_no("Delete plane polars between candidates?", True)
     output = Path(_prompt_text("Output directory", "optimization_output")).expanduser()
@@ -739,13 +855,31 @@ def main() -> None:
     if settings is None:
         return
     airfoils = settings["airfoils"]
-    spans = settings["spans"]
-    constraints = OptimizationConstraints(settings["span_limit"], tuple(airfoils))
+    output = Path(settings["output"])
+    output.mkdir(parents=True, exist_ok=True)
     gui = XFLRGui(settings["project"])
+    part = settings["part"]
+    plane = gui.plane_coordinates_from_index(settings["plane_index"])
+    baseline_path = output / "baseline_component.xml"
+    gui.export_wing(plane, baseline_path, part)
+    native_scale = PlaneXmlEditor.length_unit_to_meter(baseline_path)
+    spans = [
+        None if value is None else convert_length(value, native_scale)
+        for value in settings["spans"]
+    ]
+    span_limit = settings["span_limit"]
+    native_span_limit = None if span_limit is None else convert_length(span_limit, native_scale)
+    print(f"Native XML length scale: {native_scale:g} metres per XFLR unit.")
+    for entered, converted in zip(settings["spans"], spans):
+        if entered is not None:
+            print(f"  Span {entered} -> {converted:g} native XFLR units")
+    if span_limit is not None:
+        print(f"  Span limit {span_limit} -> {native_span_limit:g} native XFLR units")
+    constraints = OptimizationConstraints(native_span_limit, tuple(airfoils))
     analysis = settings["analysis"]
     optimizer = AircraftOptimizer(
         gui,
-        settings["output"],
+        output,
         constraints,
         settings["foil_directory"],
         settings["metric"],
@@ -757,11 +891,12 @@ def main() -> None:
         fixed_angle=analysis.fixed_angle,
         wait_seconds=analysis.wait_seconds,
     )
-    candidates = optimizer.grid_candidates(airfoils, spans, settings["part"])
+    candidates = optimizer.grid_candidates(airfoils, spans, part)
     result = optimizer.optimize(
-        gui.plane_coordinates_from_index(settings["plane_index"]),
+        plane,
         candidates,
         settings["clear_polars"],
+        baseline_path=baseline_path,
     )
     if result.best is None:
         raise SystemExit("No candidate completed successfully; see optimization_results.json for errors.")
