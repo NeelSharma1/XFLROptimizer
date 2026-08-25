@@ -1,47 +1,35 @@
 """Constrained XFLR5 GUI optimization.
 
 XFLR5 cannot batch-run plane analyses through its scripting interface, so this
-module deliberately uses its GUI. The automation is isolated in ``XFLRGui``;
-everything else (candidate generation, XML editing, validation and scoring) is
-ordinary Python and can be tested without XFLR5 installed.
+module deliberately uses its GUI. The automation is isolated in GUI adapter
+modules; everything else (candidate generation, XML editing, validation and
+scoring) is ordinary Python and can be tested without XFLR5 installed.
 
-Span values use the length units declared by the exported XFLR XML. For a
-symmetric wing, span means full tip-to-tip span (twice the largest
+Span values use the length units declared by the exported plane/component XML.
+For a symmetric wing, span means full tip-to-tip span (twice the largest
 ``y_position``); otherwise it is max(y_position) - min(y_position).
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-from math import isfinite
 import re
 import shutil
-import time
-import xml.etree.ElementTree as ET
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
-try:
-    import pyautogui as pg
-    import pyperclip
-    _GUI_IMPORT_ERROR = None
-except Exception as error:  # XML tests and result processing work without GUI packages.
-    pg = None
-    pyperclip = None
-    _GUI_IMPORT_ERROR = error
-
-
-class XFLRGuiError(RuntimeError):
-    """Raised when the GUI is not in the expected XFLR5 state."""
-
-
-class ConstraintError(ValueError):
-    """Raised when a candidate violates the configured design restrictions."""
-
-
-class LengthUnitError(ValueError):
-    """Raised when a user-entered length cannot be converted."""
+from xflr5_core import (
+    ConstraintError,
+    LengthUnitError,
+    PlaneXmlEditor,
+    XFLRGuiError,
+    convert_length,
+)
+from xflr5_legacy_gui import XFLRGui, xflmacroscript
+from xflr5_windows_gui import UiaLocator, WindowsPlaneRef, WindowsXFLRGui
 
 
 @dataclass(frozen=True)
@@ -131,389 +119,8 @@ def _safe_name(value: str) -> str:
     return safe or "candidate"
 
 
-_LENGTH_UNITS_TO_METERS = {
-    "": None,
-    "native": None,
-    "xflr": None,
-    "m": 1.0,
-    "meter": 1.0,
-    "meters": 1.0,
-    "metre": 1.0,
-    "metres": 1.0,
-    "cm": 0.01,
-    "centimeter": 0.01,
-    "centimeters": 0.01,
-    "centimetre": 0.01,
-    "centimetres": 0.01,
-    "mm": 0.001,
-    "millimeter": 0.001,
-    "millimeters": 0.001,
-    "millimetre": 0.001,
-    "millimetres": 0.001,
-    "in": 0.0254,
-    "inch": 0.0254,
-    "inches": 0.0254,
-    "ft": 0.3048,
-    "foot": 0.3048,
-    "feet": 0.3048,
-    "yd": 0.9144,
-    "yard": 0.9144,
-    "yards": 0.9144,
-}
-_LENGTH_EXPRESSION = re.compile(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)\s*$")
+# The legacy adapter is implemented in xflr5_legacy_gui.py and re-exported here.
 
-
-def convert_length(value: str | float | int, native_length_unit_to_meter: float) -> float:
-    """Convert a user length expression to the native XFLR XML unit.
-
-    Unitless values are already native XFLR values. For example, with an XML
-    scale of ``0.0254`` metres per native unit, ``convert_length('5 feet',
-    0.0254)`` returns ``60.0``.
-    """
-
-    if native_length_unit_to_meter <= 0 or not isfinite(native_length_unit_to_meter):
-        raise LengthUnitError("The XML length-unit scale must be a finite positive number.")
-    if isinstance(value, (int, float)):
-        magnitude = float(value)
-        unit = ""
-    else:
-        match = _LENGTH_EXPRESSION.fullmatch(value)
-        if match is None:
-            raise LengthUnitError(f"Invalid length {value!r}; use forms such as '5 feet', '1.2 m', or '60'.")
-        magnitude = float(match.group(1))
-        unit = match.group(2).lower()
-    if not isfinite(magnitude):
-        raise LengthUnitError(f"Length must be finite: {value!r}.")
-    if unit not in _LENGTH_UNITS_TO_METERS:
-        supported = ", ".join(("m", "cm", "mm", "in", "ft", "yd", "native"))
-        raise LengthUnitError(f"Unsupported length unit {unit!r}; use {supported}.")
-    meters_per_unit = _LENGTH_UNITS_TO_METERS[unit]
-    return magnitude if meters_per_unit is None else magnitude * meters_per_unit / native_length_unit_to_meter
-
-
-class PlaneXmlEditor:
-    """Edit XFLR-exported plane or component XML without relying on line order."""
-
-    @staticmethod
-    def length_unit_to_meter(xml_path: str | Path) -> float:
-        """Read XFLR's native length scale from an exported plane/component XML."""
-
-        tree = ET.parse(xml_path)
-        value = tree.findtext("./Units/length_unit_to_meter")
-        if value is None:
-            value = tree.findtext(".//Units/length_unit_to_meter")
-        if value is None:
-            raise LengthUnitError(f"No Units/length_unit_to_meter field was found in {xml_path}.")
-        try:
-            scale = float(value)
-        except ValueError as error:
-            raise LengthUnitError(f"Invalid XML length-unit scale {value!r} in {xml_path}.") from error
-        if scale <= 0 or not isfinite(scale):
-            raise LengthUnitError(f"XML length-unit scale must be finite and positive in {xml_path}.")
-        return scale
-
-    @staticmethod
-    def _wings(root: ET.Element, component_name: str | None = None) -> list[ET.Element]:
-        wings = list(root.findall(".//wing"))
-        if component_name is None:
-            return wings
-        return [wing for wing in wings if (wing.findtext("Name") or "").strip().lower() == component_name.lower()]
-
-    @classmethod
-    def _target_wing(cls, root: ET.Element, component_name: str | None = None) -> ET.Element:
-        wings = cls._wings(root, component_name)
-        if len(wings) != 1:
-            description = component_name or "component"
-            raise ConstraintError(f"Expected exactly one wing for {description!r}, found {len(wings)}.")
-        return wings[0]
-
-    @staticmethod
-    def _selected_sections(wing: ET.Element, sections: tuple[int, int | None]) -> list[ET.Element]:
-        start, end = sections
-        if start < 1 or (end is not None and end < start):
-            raise ConstraintError("sections must use one-indexed inclusive bounds, e.g. (1, None).")
-        selected = list(wing.findall("./Sections/Section"))[start - 1 : end]
-        if not selected:
-            raise ConstraintError("The requested section range does not select any XML sections.")
-        return selected
-
-    @classmethod
-    def replace_airfoils(
-        cls,
-        xml_path: str | Path,
-        left_airfoil: str,
-        right_airfoil: str | None = None,
-        sections: tuple[int, int | None] = (1, None),
-        component_name: str | None = None,
-    ) -> None:
-        tree = ET.parse(xml_path)
-        wing = cls._target_wing(tree.getroot(), component_name)
-        for section in cls._selected_sections(wing, sections):
-            left = section.find("Left_Side_FoilName")
-            right = section.find("Right_Side_FoilName")
-            if left is None or right is None:
-                raise ConstraintError("The selected XFLR section has no left/right airfoil fields.")
-            left.text = left_airfoil
-            right.text = right_airfoil or left_airfoil
-        ET.indent(tree, space="    ")
-        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-
-    @classmethod
-    def span(cls, xml_path: str | Path, component_name: str | None = None) -> float:
-        tree = ET.parse(xml_path)
-        wing = cls._target_wing(tree.getroot(), component_name)
-        y_positions = [float(section.findtext("y_position")) for section in wing.findall("./Sections/Section")]
-        if not y_positions:
-            raise ConstraintError("The wing has no sections.")
-        symmetric = (wing.findtext("Symetric") or "false").strip().lower() == "true"
-        return 2 * max(abs(value) for value in y_positions) if symmetric else max(y_positions) - min(y_positions)
-
-    @classmethod
-    def set_span(cls, xml_path: str | Path, target_span: float, component_name: str | None = None) -> None:
-        if target_span <= 0:
-            raise ConstraintError("span must be positive.")
-        current_span = cls.span(xml_path, component_name)
-        if current_span <= 0:
-            raise ConstraintError("Cannot scale a wing whose current span is zero.")
-        tree = ET.parse(xml_path)
-        wing = cls._target_wing(tree.getroot(), component_name)
-        scale = target_span / current_span
-        for section in wing.findall("./Sections/Section"):
-            y_position = section.find("y_position")
-            if y_position is None or y_position.text is None:
-                raise ConstraintError("The selected XFLR section has no y_position.")
-            y_position.text = f"{float(y_position.text) * scale:.6f}"
-        ET.indent(tree, space="    ")
-        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
-
-
-class XFLRGui:
-    """The narrow, XFLR5-layout-specific GUI adapter used by the optimizer."""
-
-    def __init__(
-        self,
-        project_file: str | Path,
-        image_directory: str | Path | None = None,
-        startup_timeout: float | None = 300.0,
-        clear_existing_polars: bool = False,
-    ) -> None:
-        if pg is None or pyperclip is None:
-            detail = f" Original import error: {_GUI_IMPORT_ERROR}" if _GUI_IMPORT_ERROR else ""
-            raise XFLRGuiError(
-                "The GUI dependencies could not be imported. Activate the project environment and install "
-                "requirements.txt, including a Pillow version compatible with this Python version." + detail
-            )
-        self.project_file = Path(project_file)
-        if not self.project_file.is_file():
-            raise FileNotFoundError(self.project_file)
-        self.image_directory = Path(image_directory or Path(__file__).with_name("images"))
-        self.planelist: list[str] = []
-        self.sequence_on = False
-        self._wait_for_startup(startup_timeout)
-        self.open_project_file(self.project_file)
-        time.sleep(2)
-        self.reset_to_plane_level()
-        self.plane_location = self.find_and_click("planeArrow.png", x_fraction=5, click=False)
-        if clear_existing_polars:
-            self.delete_polars(self.plane_location)
-
-    def _wait_for_startup(self, timeout: float | None) -> None:
-        """Wait for the user to bring XFLR5 to the foreground.
-
-        PyAutoGUI/PyScreeze versions differ on whether a missing image returns
-        ``None`` or raises ``ImageNotFoundException``. Both outcomes mean that
-        XFLR5 is not visible yet and must keep the polling loop alive.
-        """
-
-        deadline = None if timeout is None else time.monotonic() + timeout
-        print("Waiting for XFLR5 to be visible. Switch to XFLR5 and leave its main window onscreen...")
-        while deadline is None or time.monotonic() < deadline:
-            try:
-                found = pg.locate(str(self.image_directory / "start.png"), pg.screenshot(), confidence=0.95)
-            except Exception:
-                found = None
-            if found is not None:
-                print("XFLR5 detected; continuing automation.")
-                return
-            time.sleep(0.3)
-        raise XFLRGuiError("Timed out waiting for XFLR5. Check display scaling and images/start.png.")
-
-    @staticmethod
-    def click(point: Sequence[float]) -> None:
-        pg.click(*point)
-
-    @staticmethod
-    def enter_filename(filename: str | Path) -> None:
-        time.sleep(0.5)
-        pg.write(str(filename))
-        pg.press("enter")
-
-    @staticmethod
-    def tab_sequence(tab_count: int, double_enter: bool = False) -> None:
-        for _ in range(tab_count):
-            time.sleep(0.05)
-            pg.press("tab")
-        pg.press("enter")
-        if double_enter:
-            pg.press("enter")
-
-    def open_project_file(self, filepath: str | Path) -> None:
-        self.click((18, 36))
-        self.click((52, 81))
-        self.enter_filename(filepath)
-
-    def find_and_click(
-        self,
-        image_name: str,
-        x_fraction: float = 0.5,
-        y_fraction: float = 0.5,
-        click: bool = True,
-        confidence: float = 0.95,
-    ) -> list[float]:
-        time.sleep(0.3)
-        box = pg.locate(str(self.image_directory / image_name), pg.screenshot(), confidence=confidence)
-        if box is None:
-            raise XFLRGuiError(f"Could not locate {image_name}; XFLR5 may not match the saved UI images.")
-        point = [box.left + box.width * x_fraction, box.top + box.height * y_fraction]
-        if click:
-            self.click(point)
-        return point
-
-    @staticmethod
-    def reset_to_object_level() -> None:
-        pg.click(29, 129)
-
-    @staticmethod
-    def reset_to_plane_level() -> None:
-        pg.click(40, 129)
-
-    @staticmethod
-    def key_from_part(part: str) -> str:
-        keys = {"wing": "w", "rudder": "f", "elevator": "e", "body": "b"}
-        try:
-            return keys[part.strip().lower()]
-        except KeyError as error:
-            raise ValueError(f"Unsupported XFLR part: {part!r}") from error
-
-    def export_wing(self, plane: Sequence[float], filepath: str | Path, part: str) -> None:
-        self.click(plane)
-        pg.hotkey("ctrl", self.key_from_part(part))
-        self.find_and_click("otherButton.png")
-        self.tab_sequence(1)
-        self.enter_filename(filepath)
-        self.tab_sequence(2)
-        time.sleep(1)
-
-    def import_wing(self, plane: Sequence[float], filepath: str | Path, part: str) -> None:
-        self.click(plane)
-        pg.hotkey("ctrl", self.key_from_part(part))
-        self.find_and_click("otherButton.png")
-        self.tab_sequence(2)
-        self.enter_filename(filepath)
-        self.tab_sequence(1)
-
-    def replace_part_from_xml(self, plane: Sequence[float], filepath: str | Path, part: str) -> None:
-        """Import a replacement and accept XFLR's default save action."""
-
-        self.import_wing(plane, filepath, part)
-        pg.press("enter")
-
-    def swap_part_airfoil(
-        self,
-        plane: Sequence[float],
-        part: str,
-        left_airfoil: str,
-        right_airfoil: str | None = None,
-        xml_path: str | Path = "component.xml",
-        sections: tuple[int, int | None] = (1, None),
-    ) -> None:
-        self.export_wing(plane, xml_path, part)
-        PlaneXmlEditor.replace_airfoils(xml_path, left_airfoil, right_airfoil, sections)
-        self.replace_part_from_xml(plane, xml_path, part)
-
-    def alpha_or_beta_sweep(
-        self,
-        plane: Sequence[float],
-        name: str,
-        results_out: str | Path,
-        speed: float = 70.0,
-        sweep_start: float = -13.0,
-        sweep_end: float = 13.0,
-        sweep_increment: float = 0.5,
-        fixed_angle: float = 0.0,
-        wait_seconds: float = 20.0,
-    ) -> None:
-        self.click(plane)
-        pg.press("f6")
-        pg.write(str(speed))
-        pg.press("tab")
-        pg.write(str(fixed_angle))
-        pg.press("tab")
-        pg.press("space")
-        pg.press("tab")
-        pg.write(name)
-        pg.press("enter", presses=2)
-        if not self.sequence_on:
-            self.find_and_click("sequenceOff.png", x_fraction=0.15, confidence=0.999)
-            self.sequence_on = True
-        coordinates = self.find_and_click("startAnalysis.png", x_fraction=2, click=False)
-        for value in (sweep_start, sweep_end, sweep_increment):
-            pg.tripleClick(*coordinates)
-            pg.write(str(value))
-            coordinates[1] += 25
-        coordinates[1] += 30
-        self.click(coordinates)
-        time.sleep(wait_seconds)
-        self.reset_to_plane_level()
-        pg.doubleClick(*plane)
-        analysis_location = self.find_analysis(name, plane)
-        if analysis_location is None:
-            raise XFLRGuiError(f"XFLR5 did not create analysis {name!r}.")
-        self.click(analysis_location)
-        pg.rightClick(*analysis_location)
-        self.find_and_click("expRes.png")
-        self.enter_filename(results_out)
-        self.reset_to_plane_level()
-
-    def copy_paste(self) -> str:
-        pg.hotkey("ctrl", "c")
-        return pyperclip.paste()
-
-    def check_plane_name(self, coordinates: Sequence[float]) -> str:
-        pg.doubleClick(*coordinates)
-        pg.press("f2")
-        name = self.copy_paste()
-        pg.press("enter", presses=2)
-        pg.doubleClick(*coordinates)
-        return name
-
-    def find_analysis(self, name: str, plane: Sequence[float], max_rows: int = 200) -> list[float] | None:
-        location = [plane[0] + 10, plane[1] + 15]
-        previous_name: str | None = None
-        for _ in range(max_rows):
-            self.click(location)
-            pg.hotkey("shift", "f2")
-            found_name = self.copy_paste()
-            pg.press("escape")
-            if name == found_name:
-                return location
-            if found_name == previous_name:
-                return None
-            previous_name = found_name
-            location[1] += 15
-        raise XFLRGuiError("Analysis tree traversal exceeded max_rows.")
-
-    def plane_coordinates_from_index(self, index: int) -> list[float]:
-        return [self.plane_location[0], self.plane_location[1] + 15 * index]
-
-    def delete_polars(self, plane: Sequence[float]) -> None:
-        pg.rightClick(*plane)
-        self.find_and_click("delPolars.png")
-        pg.press("enter")
-
-
-# Preserve the original public class name for existing user scripts.
-xflmacroscript = XFLRGui
 
 
 def parse_result_table(result_file: str | Path) -> list[dict[str, float]]:
@@ -567,7 +174,7 @@ class AircraftOptimizer:
 
     def __init__(
         self,
-        gui: XFLRGui | None,
+        gui: Any | None,
         work_directory: str | Path,
         constraints: OptimizationConstraints,
         foil_directory: str | Path | None = None,
@@ -638,7 +245,7 @@ class AircraftOptimizer:
 
     def optimize(
         self,
-        plane: Sequence[float],
+        plane: Any,
         candidates: Iterable[AircraftCandidate],
         clear_polars_between_runs: bool = True,
         continue_on_error: bool = True,
@@ -863,14 +470,50 @@ def _interactive_settings() -> dict[str, object] | None:
     }
 
 
-def main() -> None:
+def _parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the constrained XFLR5 aircraft optimizer.")
+    parser.add_argument(
+        "--gui-backend",
+        choices=("auto", "windows", "legacy"),
+        default="auto",
+        help="GUI adapter to use; auto selects UI Automation on Windows and the legacy adapter elsewhere.",
+    )
+    parser.add_argument(
+        "--xflr5-executable",
+        type=Path,
+        help="Optional Windows xflr5.exe path to launch when no running XFLR5 process is found.",
+    )
+    return parser.parse_args(argv)
+
+
+def _make_gui(
+    project_file: str | Path,
+    backend: str = "auto",
+    executable_path: str | Path | None = None,
+) -> Any:
+    selected = backend.strip().lower()
+    if selected == "auto":
+        selected = "windows" if sys.platform == "win32" else "legacy"
+    if selected == "windows":
+        if sys.platform != "win32":
+            raise XFLRGuiError("The Windows UI Automation backend can only run on Windows.")
+        from xflr5_windows_gui import WindowsXFLRGui
+
+        return WindowsXFLRGui(project_file, executable_path=executable_path)
+    if selected == "legacy":
+        return XFLRGui(project_file)
+    raise ValueError(f"Unsupported GUI backend {backend!r}; use auto, windows, or legacy.")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_cli_args(argv)
     settings = _interactive_settings()
     if settings is None:
         return
     airfoils = settings["airfoils"]
     output = Path(settings["output"])
     output.mkdir(parents=True, exist_ok=True)
-    gui = XFLRGui(settings["project"])
+    gui = _make_gui(settings["project"], args.gui_backend, args.xflr5_executable)
     part = settings["part"]
     plane = gui.plane_coordinates_from_index(settings["plane_index"])
     baseline_path = output / "baseline_component.xml"
