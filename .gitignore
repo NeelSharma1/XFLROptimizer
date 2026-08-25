@@ -1,0 +1,13 @@
+# IDE settings
+.idea/
+
+# Local virtual environments
+venv/
+.venv/
+
+# XFLR5 project files
+*.xfl
+
+# Python generated files
+__pycache__/
+*.py[cod]
