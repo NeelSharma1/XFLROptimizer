@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE explane>
+<explane version="1.0">
+    <Units>
+        <length_unit_to_meter>0.0254</length_unit_to_meter>
+        <mass_unit_to_kg>0.453592</mass_unit_to_kg>
+    </Units>
+    <wing>
+        <Name>Elevator</Name>
+        <Type>ELEVATOR</Type>
+        <Color>
+            <red>135</red>
+            <green>150</green>
+            <blue>122</blue>
+            <alpha>255</alpha>
+        </Color>
+        <Description></Description>
+        <Position>          0,           0,           0</Position>
+        <Tilt_angle>  0.000</Tilt_angle>
+        <Symetric>true</Symetric>
+        <isFin>false</isFin>
+        <isDoubleFin>false</isDoubleFin>
+        <isSymFin>false</isSymFin>
+        <Inertia>
+            <Volume_Mass>  0.000</Volume_Mass>
+        </Inertia>
+        <Sections>
+            <Section>
+                <y_position>  0.000</y_position>
+                <Chord> 15.000</Chord>
+                <xOffset>  0.000</xOffset>
+                <Dihedral>  0.000</Dihedral>
+                <Twist>  0.000</Twist>
+                <x_number_of_panels>7</x_number_of_panels>
+                <x_panel_distribution>SINE</x_panel_distribution>
+                <y_number_of_panels>10</y_number_of_panels>
+                <y_panel_distribution>UNIFORM</y_panel_distribution>
+                <Left_Side_FoilName>Reflexed_2412</Left_Side_FoilName>
+                <Right_Side_FoilName>Reflexed_2412</Right_Side_FoilName>
+            </Section>
+            <Section>
+                <y_position>  4.000</y_position>
+                <Chord> 15.000</Chord>
+                <xOffset>  0.000</xOffset>
+                <Dihedral>  0.000</Dihedral>
+                <Twist>  0.000</Twist>
+                <x_number_of_panels>7</x_number_of_panels>
+                <x_panel_distribution>SINE</x_panel_distribution>
+                <y_number_of_panels>9</y_number_of_panels>
+                <y_panel_distribution>UNIFORM</y_panel_distribution>
+                <Left_Side_FoilName>Reflexed_2412</Left_Side_FoilName>
+                <Right_Side_FoilName>Reflexed_2412</Right_Side_FoilName>
+            </Section>
+            <Section>
+                <y_position> 15.000</y_position>
+                <Chord> 15.000</Chord>
+                <xOffset>  0.000</xOffset>
+                <Dihedral>  0.000</Dihedral>
+                <Twist>  0.000</Twist>
+                <x_number_of_panels>13</x_number_of_panels>
+                <x_panel_distribution>COSINE</x_panel_distribution>
+                <y_number_of_panels>7</y_number_of_panels>
+                <y_panel_distribution>UNIFORM</y_panel_distribution>
+                <Left_Side_FoilName>Reflexed_2412</Left_Side_FoilName>
+                <Right_Side_FoilName>Reflexed_2412</Right_Side_FoilName>
+            </Section>
+        </Sections>
+    </wing>
+</explane>

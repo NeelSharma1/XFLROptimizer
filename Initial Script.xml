@@ -1,0 +1,18 @@
+<xflscript version="1.0">
+	<Metadata>
+		<make_project_file>True</make_project_file>
+		<project_file_name>VTSv1</project_file_name>
+		<polar_text_output_format>CSV</polar_text_output_format>
+		<Directories>
+			<output_dir>C:\Users\neels\Downloads\DBF XFLR\VTSv1\</output_dir>
+			<foil_files_dir>C:\Users\neels\Downloads\DBF XFLR\Foil_Folder\</foil_files_dir>
+			<foil_analysis_xml_dir>C:\Users\neels\Downloads\DBF XFLR\VTSv1\Analysis_Outputs\</foil_analysis_xml_dir>
+			<foil_polars_dir>C:\Users\neels\Downloads\DBF XFLR\Foil_Folder\Polars\</foil_polars_dir>
+		</Directories>
+		<MultiThreading>
+			<Allow_Multithreading>True</Allow_Multithreading>
+			<Thread_Priority>High</Thread_Priority>
+			<Max_threads>1</Max_threads>
+		</MultiThreading>
+	</Metadata>
+</xflscript>
