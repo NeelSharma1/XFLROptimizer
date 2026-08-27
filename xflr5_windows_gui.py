@@ -363,10 +363,16 @@ class WindowsXFLRGui:
         self._app: Any = None
         self._desktop: Any = None
         self._main: Any = None
+        self._process_id: int | None = None
         self._last_plane: WindowsPlaneRef | None = None
         self._connect(executable_path, startup_timeout)
         self.open_project_file(self.project_file)
-        self._wait_for(lambda: self._plane_items() or None, "XFLR5 plane tree", startup_timeout)
+        try:
+            self._wait_for(lambda: self._plane_items() or None, "XFLR5 plane tree", startup_timeout)
+        except XFLRGuiError as error:
+            raise XFLRGuiError(
+                "XFLR5 was focused and the project-open command completed, but no plane appeared in its UIA tree."
+            ) from error
         self.plane_location = self.plane_coordinates_from_index(0)
         self.reset_to_plane_level()
         if clear_existing_polars:
@@ -442,6 +448,8 @@ class WindowsXFLRGui:
             try:
                 self._app = Application(backend="uia").connect(process=process_id, timeout=timeout_value)
                 self._main = main_window
+                self._process_id = process_id
+                self._activate_main()
                 return
             except Exception as error:
                 raise XFLRGuiError(
@@ -458,6 +466,8 @@ class WindowsXFLRGui:
             main_spec = self._app.window(title_re=self._WINDOW_TITLE_RE)
             main_spec.wait("visible enabled ready", timeout=timeout_value)
             self._main = main_spec.wrapper_object()
+            self._process_id = int(self._main.process_id())
+            self._activate_main()
         except Exception as error:
             raise XFLRGuiError("Could not launch XFLR5 or access its main UIA window.") from error
 
@@ -540,20 +550,39 @@ class WindowsXFLRGui:
         )
 
     def _visible_windows(self) -> list[Any]:
+        windows: list[Any] = []
         try:
-            windows = list(self._app.windows())
+            windows.extend(self._app.windows())
         except Exception:
-            return []
+            pass
+        # Some Qt dialogs are exposed by Desktop but not by the connected
+        # Application object's window list. Keep the search in XFLR5's PID so
+        # another application's Open dialog cannot be selected accidentally.
+        if self._desktop is not None and self._process_id is not None:
+            try:
+                for window in self._desktop.windows():
+                    try:
+                        if int(window.process_id()) == self._process_id:
+                            windows.append(window)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        windows = self._deduplicate(windows)
         visible: list[Any] = []
         main_handle = getattr(self._main, "handle", None)
+        main_key = self._element_key(self._main) if self._main is not None else None
         for window in windows:
             try:
                 if not window.is_visible():
                     continue
             except Exception:
                 continue
-            if main_handle is None or getattr(window, "handle", None) != main_handle:
-                visible.append(window)
+            if main_handle is not None and getattr(window, "handle", None) == main_handle:
+                continue
+            if main_key is not None and self._element_key(window) == main_key:
+                continue
+            visible.append(window)
         return visible
 
     def _control_any_window(self, locator: UiaLocator, description: str, timeout: float | None = 10.0) -> Any:
@@ -593,6 +622,29 @@ class WindowsXFLRGui:
 
     # ---------- deterministic input helpers ----------
 
+    def _activate_main(self) -> None:
+        """Restore and focus XFLR5 before sending a keyboard command."""
+
+        if self._main is None:
+            raise XFLRGuiError("The XFLR5 main window is not connected.")
+        try:
+            restore = getattr(self._main, "restore", None)
+            if callable(restore):
+                try:
+                    restore()
+                except Exception:
+                    # A visible window may not support Restore; SetFocus is
+                    # still sufficient for the normal and maximized cases.
+                    pass
+            focus = getattr(self._main, "set_focus", None)
+            if not callable(focus):
+                raise XFLRGuiError("The XFLR5 main window does not expose a focus operation.")
+            focus()
+        except XFLRGuiError:
+            raise
+        except Exception as error:
+            raise XFLRGuiError("Could not focus the XFLR5 main window.") from error
+
     @staticmethod
     def _invoke(control: Any, description: str) -> None:
         invoke = getattr(control, "invoke", None)
@@ -627,6 +679,7 @@ class WindowsXFLRGui:
         try:
             if target is not None:
                 target.set_focus()
+                time.sleep(0.05)
             send_keys(keys)
         except Exception as error:
             raise XFLRGuiError(f"Could not send deterministic keyboard sequence {keys!r}.") from error
@@ -648,7 +701,9 @@ class WindowsXFLRGui:
         except XFLRGuiError:
             # Menu accelerators are deterministic and useful for Qt menu items
             # which do not expose their popup menu through UIA.
+            self._activate_main()
             self._send_keys("%f", self._main)
+            time.sleep(self._POLL_INTERVAL)
             for title in titles[1:]:
                 accelerator = {"Open": "o", "Open Project": "o", "Save": "s"}.get(title)
                 if accelerator is None:
@@ -667,13 +722,35 @@ class WindowsXFLRGui:
 
         return self._wait_for(locate, f"{action} file dialog", timeout)
 
-    def _complete_file_dialog(self, filepath: str | Path, action: str) -> None:
-        dialog = self._file_dialog(action)
-        filename = self._control(dialog, _LOCATORS["file_name_edit"], "file-name field")
-        self._set_text(filename, str(Path(filepath)), "file name")
-        button_key = "open_button" if action == "open" else "save_button"
-        button = self._control(dialog, _LOCATORS[button_key], f"{action} file button")
-        self._invoke(button, f"{action} file button")
+    def _complete_file_dialog(
+        self,
+        filepath: str | Path,
+        action: str,
+        timeout: float | None = 10.0,
+    ) -> None:
+        try:
+            dialog = self._file_dialog(action, timeout)
+            filename = self._control(dialog, _LOCATORS["file_name_edit"], "file-name field")
+            self._set_text(filename, str(Path(filepath)), "file name")
+            button_key = "open_button" if action == "open" else "save_button"
+            button = self._control(dialog, _LOCATORS[button_key], f"{action} file button")
+            self._invoke(button, f"{action} file button")
+            return
+        except _UiaAmbiguousError:
+            raise
+        except XFLRGuiError as ui_error:
+            # Qt's file dialog can expose a top-level window without exposing
+            # its child edit/button patterns. Its focused filename field is
+            # still deterministic keyboard input, and remains coordinate-free.
+            try:
+                dialog = self._wait_secondary_window(f"{action} file dialog", min(timeout or 10.0, 2.0))
+                edits = self._descendants(dialog, control_type="Edit")
+                input_target = edits[0] if len(edits) == 1 else dialog
+                self._send_keys(str(Path(filepath)), input_target)
+                self._send_keys("{ENTER}", input_target)
+                return
+            except XFLRGuiError:
+                raise ui_error
 
     def _analysis_edit(self, parent: Any, key: str, description: str, fallback_index: int | None = None) -> Any:
         locator = _LOCATORS[key]
@@ -760,8 +837,23 @@ class WindowsXFLRGui:
     # ---------- XFLR5 workflow ----------
 
     def open_project_file(self, filepath: str | Path) -> None:
-        self._invoke_menu_path(("File", "Open"))
-        self._complete_file_dialog(filepath, "open")
+        self._activate_main()
+        # XFLR5 exposes File -> Open as Ctrl+O. This works even when Qt's menu
+        # items are absent from the UIA tree; the semantic UIA path remains a
+        # fallback for builds with different shortcut configuration.
+        self._send_keys("^o", self._main)
+        try:
+            self._complete_file_dialog(filepath, "open", timeout=3.0)
+            return
+        except XFLRGuiError:
+            self._activate_main()
+            self._invoke_menu_path(("File", "Open"))
+            try:
+                self._complete_file_dialog(filepath, "open")
+            except XFLRGuiError as menu_error:
+                raise XFLRGuiError(
+                    "XFLR5 was focused, but neither Ctrl+O nor the File > Open UIA path opened a file dialog."
+                ) from menu_error
 
     def enter_filename(self, filename: str | Path) -> None:
         dialog = self._wait_secondary_window("file dialog")
@@ -785,12 +877,19 @@ class WindowsXFLRGui:
 
     def _plane_items(self) -> list[Any]:
         tree = self._plane_tree()
-        try:
-            items = list(tree.children(control_type="TreeItem"))
-        except Exception:
-            items = []
+        items: list[Any] = []
+        for control_type in ("TreeItem", "ListItem", "DataItem"):
+            try:
+                items.extend(tree.children(control_type=control_type))
+            except Exception:
+                continue
+            if items:
+                break
         if not items:
-            items = self._descendants(tree, control_type="TreeItem")
+            for control_type in ("TreeItem", "ListItem", "DataItem"):
+                items = self._descendants(tree, control_type=control_type)
+                if items:
+                    break
             direct_items: list[Any] = []
             tree_key = self._element_key(tree)
             for item in items:

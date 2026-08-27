@@ -53,6 +53,7 @@ class FakeWindow:
         self._process_id = process_id
         self._title = title
         self._visible = visible
+        self.focused = False
 
     def is_visible(self):
         return self._visible
@@ -62,6 +63,12 @@ class FakeWindow:
 
     def window_text(self):
         return self._title
+
+    def restore(self):
+        self._visible = True
+
+    def set_focus(self):
+        self.focused = True
 
 
 class FakeDesktop:
@@ -193,6 +200,20 @@ class WindowsUiAutomationTests(unittest.TestCase):
         app.connect.assert_called_once_with(process=1234, timeout=5.0)
         app.start.assert_not_called()
         self.assertIs(adapter._main, main_window)
+        self.assertTrue(main_window.focused)
+
+    def test_project_open_uses_xflr5_ctrl_o_shortcut_first(self):
+        main_window = FakeWindow(1234, "Project")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = main_window
+
+        with patch.object(adapter, "_send_keys") as send_keys, patch.object(
+            adapter, "_complete_file_dialog"
+        ) as complete_dialog:
+            adapter.open_project_file(Path("project.xfl"))
+
+        send_keys.assert_called_once_with("^o", main_window)
+        complete_dialog.assert_called_once_with(Path("project.xfl"), "open", timeout=3.0)
 
 
 if __name__ == "__main__":
