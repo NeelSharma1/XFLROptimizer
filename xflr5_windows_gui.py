@@ -549,7 +549,7 @@ class WindowsXFLRGui:
             timeout,
         )
 
-    def _visible_windows(self) -> list[Any]:
+    def _visible_windows(self, include_unrelated_desktop: bool = False) -> list[Any]:
         windows: list[Any] = []
         try:
             windows.extend(self._app.windows())
@@ -562,7 +562,7 @@ class WindowsXFLRGui:
             try:
                 for window in self._desktop.windows():
                     try:
-                        if int(window.process_id()) == self._process_id:
+                        if include_unrelated_desktop or int(window.process_id()) == self._process_id:
                             windows.append(window)
                     except Exception:
                         continue
@@ -714,13 +714,31 @@ class WindowsXFLRGui:
         locator = _LOCATORS["open_button"] if action == "open" else _LOCATORS["save_button"]
 
         def locate() -> Any | None:
-            for window in self._visible_windows():
-                if self._locate_once(window, _LOCATORS["file_name_edit"]) is not None:
-                    if self._locate_once(window, locator) is not None:
-                        return window
+            windows = self._visible_windows()
+            windows.extend(self._visible_windows(include_unrelated_desktop=True))
+            for window in self._deduplicate(windows):
+                if self._locate_once(window, _LOCATORS["file_name_edit"]) is not None and self._locate_once(
+                    window, locator
+                ) is not None:
+                    return window
             return None
 
         return self._wait_for(locate, f"{action} file dialog", timeout)
+
+    def _file_dialog_window(self, action: str) -> Any | None:
+        """Find a native/Qt file dialog even when its child controls are hidden from UIA."""
+
+        action_name = action.casefold()
+        candidates: list[Any] = []
+        for window in self._visible_windows(include_unrelated_desktop=True):
+            try:
+                title = str(window.window_text() or "").strip().casefold()
+            except Exception:
+                title = ""
+            if action_name in title or title in {"file dialog", "file picker"}:
+                return window
+            candidates.append(window)
+        return candidates[0] if len(candidates) == 1 else None
 
     def _complete_file_dialog(
         self,
@@ -743,11 +761,18 @@ class WindowsXFLRGui:
             # its child edit/button patterns. Its focused filename field is
             # still deterministic keyboard input, and remains coordinate-free.
             try:
-                dialog = self._wait_secondary_window(f"{action} file dialog", min(timeout or 10.0, 2.0))
-                edits = self._descendants(dialog, control_type="Edit")
-                input_target = edits[0] if len(edits) == 1 else dialog
-                self._send_keys(str(Path(filepath)), input_target)
-                self._send_keys("{ENTER}", input_target)
+                dialog = self._wait_for(
+                    lambda: self._file_dialog_window(action),
+                    f"{action} file dialog",
+                    min(timeout or 10.0, 2.0),
+                )
+                # Native Windows and Qt file dialogs conventionally expose
+                # the filename field through the Alt+N mnemonic. Once it is
+                # focused, typing and Enter do not depend on UIA child nodes.
+                self._send_keys("%n", dialog)
+                self._send_keys("^a")
+                self._send_keys(str(Path(filepath)))
+                self._send_keys("{ENTER}")
                 return
             except XFLRGuiError:
                 raise ui_error

@@ -1,6 +1,6 @@
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import Revamped_XFLRPlaneScript as application
 from xflr5_core import XFLRGuiError
@@ -214,6 +214,30 @@ class WindowsUiAutomationTests(unittest.TestCase):
 
         send_keys.assert_called_once_with("^o", main_window)
         complete_dialog.assert_called_once_with(Path("project.xfl"), "open", timeout=3.0)
+
+    def test_file_dialog_fallback_focuses_filename_and_submits_path(self):
+        dialog = FakeWindow(1234, "Open")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = FakeWindow(1234, "Project")
+        adapter._app = Mock()
+        adapter._app.windows.return_value = []
+        adapter._desktop = FakeDesktop(dialog)
+        adapter._process_id = 1234
+
+        with patch.object(adapter, "_file_dialog", side_effect=XFLRGuiError("UIA controls unavailable")), patch.object(
+            adapter, "_send_keys"
+        ) as send_keys:
+            adapter._complete_file_dialog(Path("C:/work/project.xfl"), "open", timeout=0.1)
+
+        self.assertEqual(
+            send_keys.call_args_list,
+            [
+                call("%n", dialog),
+                call("^a"),
+                call("C:/work/project.xfl"),
+                call("{ENTER}"),
+            ],
+        )
 
 
 if __name__ == "__main__":
