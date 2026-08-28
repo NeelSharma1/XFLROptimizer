@@ -276,66 +276,19 @@ class WindowsUiAutomationTests(unittest.TestCase):
             adapter.open_project_file(Path("project.xfl"))
 
         send_keys.assert_called_once_with("^o", main_window)
-        complete_dialog.assert_called_once_with(Path("project.xfl"), "open", timeout=3.0)
+        complete_dialog.assert_called_once_with(Path("project.xfl"), "open")
 
-    def test_file_dialog_fallback_focuses_filename_and_submits_path(self):
-        dialog = FakeWindow(1234, "Open")
+    def test_file_dialog_waits_then_types_into_assumed_focused_filename_field(self):
         adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
-        adapter._main = FakeWindow(1234, "Project")
-        adapter._app = Mock()
-        adapter._app.windows.return_value = []
-        adapter._desktop = FakeDesktop(dialog)
-        adapter._process_id = 1234
 
-        with patch.object(adapter, "_file_dialog", side_effect=XFLRGuiError("UIA controls unavailable")), patch.object(
-            adapter, "_send_keys"
-        ) as send_keys:
-            adapter._complete_file_dialog(Path("C:/work/project.xfl"), "open", timeout=0.1)
+        with patch("xflr5_windows_gui.time.sleep") as sleep, patch.object(adapter, "_send_keys") as send_keys:
+            adapter._complete_file_dialog(Path("C:/work/project.xfl"), "open")
 
+        sleep.assert_called_once_with(3.0)
         self.assertEqual(
             send_keys.call_args_list,
-            [
-                call("%n", dialog),
-                call("^a"),
-                call("C:/work/project.xfl"),
-                call("{ENTER}"),
-            ],
+            [call("C:/work/project.xfl"), call("{ENTER}")],
         )
-
-    def test_file_dialog_search_does_not_consume_optimizer_picker(self):
-        optimizer_picker = FakeWindow(9999, "Select XFLR5 optimizer configuration")
-        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
-        adapter._main = FakeWindow(1234, "Project")
-        adapter._app = Mock()
-        adapter._app.windows.return_value = []
-        adapter._desktop = FakeDesktop(optimizer_picker)
-        adapter._process_id = 1234
-
-        self.assertIsNone(adapter._file_dialog_window("open"))
-
-    def test_native_file_dialog_wins_over_visible_component_editor(self):
-        component_editor = FakeWindow(1234, "Wing Design")
-        native_dialog = FakeWindow(9999, "Open")
-        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
-        adapter._main = FakeWindow(1234, "Project")
-        adapter._app = Mock()
-        adapter._app.windows.return_value = []
-        adapter._desktop = FakeDesktop(component_editor, native_dialog)
-        adapter._process_id = 1234
-
-        self.assertIs(adapter._file_dialog_window("open"), native_dialog)
-
-    def test_project_open_does_not_open_a_second_dialog_after_a_visible_dialog_error(self):
-        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
-        adapter._main = FakeWindow(1234, "Project")
-
-        with patch.object(adapter, "_send_keys"), patch.object(adapter, "_activate_main"), patch.object(
-            adapter, "_complete_file_dialog", side_effect=XFLRGuiError("dialog input failed")
-        ), patch.object(adapter, "_invoke_menu_path") as invoke_menu:
-            with self.assertRaisesRegex(XFLRGuiError, "dialog input failed"):
-                adapter.open_project_file(Path("project.xfl"))
-
-        invoke_menu.assert_not_called()
 
     def test_plane_selection_falls_back_to_focus_when_selection_pattern_is_missing(self):
         item = SelectionPatternMissingControl("plane", title="Plane 1", control_type="TreeItem")

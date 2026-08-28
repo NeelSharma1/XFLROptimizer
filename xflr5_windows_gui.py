@@ -66,10 +66,6 @@ class _UiaAmbiguousError(XFLRGuiError):
     """Internal distinction between an absent and an ambiguous control."""
 
 
-class _FileDialogNotFoundError(XFLRGuiError):
-    """The command did not produce a visible file dialog."""
-
-
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _TOKEN_QUERY = 0x0008
 _TOKEN_ELEVATION = 20
@@ -350,7 +346,10 @@ class WindowsXFLRGui:
     # still determined by UIA polling in _wait_for.
     _POLL_INTERVAL = 0.02
     _INPUT_SETTLE_DELAY = 0.01
-    _UIA_PROBE_TIMEOUT = 0.20
+    # XFLR5 opens a modal native/Qt file dialog after the triggering action.
+    # The legacy adapter gives that dialog a fixed opportunity to open and
+    # relies on its default focus being in the filename field.
+    _FILE_DIALOG_OPEN_DELAY = 3.0
 
     def __init__(
         self,
@@ -737,65 +736,6 @@ class WindowsXFLRGui:
         except Exception as error:
             raise XFLRGuiError(f"Could not send deterministic keyboard sequence {keys!r}.") from error
 
-    def _invoke_menu_path(self, titles: tuple[str, ...]) -> None:
-        parent = self._main
-        try:
-            for title in titles:
-                control = self._control(
-                    parent,
-                    UiaLocator("MenuItem", titles=(title,)),
-                    f"menu item {title!r}",
-                    timeout=1.0,
-                )
-                self._invoke(control, f"menu item {title!r}")
-                parent = self._main
-        except _UiaAmbiguousError:
-            raise
-        except XFLRGuiError:
-            # Menu accelerators are deterministic and useful for Qt menu items
-            # which do not expose their popup menu through UIA.
-            self._activate_main()
-            self._send_keys("%f", self._main)
-            time.sleep(self._POLL_INTERVAL)
-            for title in titles[1:]:
-                accelerator = {"Open": "o", "Open Project": "o", "Save": "s"}.get(title)
-                if accelerator is None:
-                    raise
-                self._send_keys(accelerator)
-
-    def _file_dialog(self, action: str, timeout: float | None = 10.0) -> Any:
-        locator = _LOCATORS["open_button"] if action == "open" else _LOCATORS["save_button"]
-
-        def locate() -> Any | None:
-            # A file dialog belongs to the connected XFLR5 process. Do not
-            # search every desktop window here: the optimizer's own Tk picker,
-            # a terminal, or another application's dialog can otherwise be
-            # mistaken for XFLR5's dialog.
-            parents = [self._main, *self._visible_windows()]
-            for window in parents:
-                if window is None:
-                    continue
-                if self._locate_once(window, _LOCATORS["file_name_edit"]) is not None and self._locate_once(
-                    window, locator
-                ) is not None:
-                    return window
-            return None
-
-        return self._wait_for(locate, f"{action} file dialog", timeout)
-
-    @staticmethod
-    def _window_class_name(window: Any) -> str:
-        try:
-            class_name = getattr(window, "class_name", None)
-            if callable(class_name):
-                value = class_name()
-                if value:
-                    return str(value).strip()
-        except Exception:
-            pass
-        info = getattr(window, "element_info", None)
-        return str(getattr(info, "class_name", "") or "").strip()
-
     @staticmethod
     def _window_title(window: Any) -> str:
         try:
@@ -803,163 +743,18 @@ class WindowsXFLRGui:
         except Exception:
             return ""
 
-    @staticmethod
-    def _looks_like_file_dialog(window: Any, action: str) -> bool:
-        title = WindowsXFLRGui._window_title(window).casefold()
-        class_name = WindowsXFLRGui._window_class_name(window)
-        title_words = {
-            "open": ("open", "select", "choose", "import", "load"),
-            "save": ("save", "export"),
-        }.get(action.casefold(), (action.casefold(),))
-        if "optimizer" in title or "configuration" in title:
-            return False
-        return (
-            title in {"file dialog", "file picker"}
-            or any(word in title for word in title_words)
-            # Qt5QWindowIcon/Qt6QWindowIcon are generic classes used by the
-            # main window and component editor too; they are not sufficient
-            # evidence on their own.
-            or class_name in {"#32770", "QFileDialog"}
-        )
+    def _complete_file_dialog(self, filepath: str | Path, _action: str = "open") -> None:
+        """Enter a path into the already-focused XFLR5 file dialog.
 
-    def _file_dialog_window(self, action: str) -> Any | None:
-        """Find a native/Qt file dialog even when its child controls are hidden from UIA."""
+        XFLR5's dialog is assumed to focus its filename field when it opens,
+        matching the legacy adapter's behavior. No UIA dialog discovery is
+        attempted because some XFLR5/Qt builds expose the dialog without a
+        usable filename control tree.
+        """
 
-        # Restrict this fallback to XFLR5's PID as well. The filename picker
-        # opened by the optimizer is intentionally a separate UI and must not
-        # be consumed by the XFLR5 adapter.
-        same_process_windows = self._visible_windows()
-        if self._main is not None:
-            if self._locate_once(self._main, _LOCATORS["file_name_edit"]) is not None:
-                locator = _LOCATORS["open_button"] if action == "open" else _LOCATORS["save_button"]
-                if self._locate_once(self._main, locator) is not None:
-                    return self._main
-        candidates: list[Any] = []
-        for window in same_process_windows:
-            if self._looks_like_file_dialog(window, action):
-                return window
-            candidates.append(window)
-
-        # A native Windows common dialog can occasionally be hosted by the
-        # shell rather than by the Qt process that requested it. Consider that
-        # case only after searching XFLR5's own process, and only for a window
-        # whose title/class identifies it as a file dialog. This prevents the
-        # optimizer's Tk picker or the terminal host from being selected.
-        try:
-            desktop_windows = self._visible_windows(include_unrelated_desktop=True)
-        except Exception:
-            desktop_windows = []
-        for window in desktop_windows:
-            if window in same_process_windows:
-                continue
-            if self._looks_like_file_dialog(window, action):
-                return window
-        # Only use an unlabelled XFLR5 secondary window as a last resort. The
-        # actual native dialog may be outside XFLR5's PID while the component
-        # editor is still visible, so this fallback must not win first.
-        if len(candidates) == 1:
-            return candidates[0]
-        return None
-
-    def _file_name_edit(self, dialog: Any) -> Any | None:
-        """Find the filename edit even when its accessible name is blank."""
-
-        exact = self._locate_once(dialog, _LOCATORS["file_name_edit"])
-        if exact is not None:
-            return exact
-        edits = self._descendants(dialog, control_type="Edit")
-        if len(edits) == 1:
-            return edits[0]
-        identified: list[Any] = []
-        for edit in edits:
-            info = getattr(edit, "element_info", None)
-            automation_id = str(getattr(info, "automation_id", "") or "")
-            title = self._control_name(edit).casefold()
-            if automation_id in {"1148", "fileNameEdit", "filenameEdit"} or title in {
-                "file name",
-                "file name:",
-                "filename",
-            }:
-                identified.append(edit)
-        if len(identified) == 1:
-            return identified[0]
-        return None
-
-    def _complete_file_dialog_keyboard(self, dialog: Any, filepath: str | Path) -> None:
-        """Fill a dialog with deterministic keyboard input when UIA has no edits."""
-
-        # Non-native Qt QFileDialog windows generally expose the location bar
-        # through Ctrl+L. Native Windows common dialogs use the File name
-        # mnemonic instead. Both routes stay coordinate-free.
-        class_name = self._window_class_name(dialog).casefold()
-        if "qt" in class_name or "qfiledialog" in class_name:
-            self._send_keys("^l", dialog)
-        else:
-            self._send_keys("%n", dialog)
-        self._send_keys("^a")
-        self._send_keys(str(Path(filepath)))
+        time.sleep(self._FILE_DIALOG_OPEN_DELAY)
+        self._send_keys(str(filepath))
         self._send_keys("{ENTER}")
-
-    def _complete_file_dialog(
-        self,
-        filepath: str | Path,
-        action: str,
-        timeout: float | None = 10.0,
-    ) -> None:
-        # First look for the top-level dialog. This handles the common XFLR5
-        # case where the dialog is visible but Qt does not expose its child
-        # controls through UIA.
-        started = time.monotonic()
-        dialog = self._file_dialog_window(action)
-        ui_error: XFLRGuiError | None = None
-        try:
-            if dialog is None:
-                # Give UIA controls a brief opportunity to appear, but do not
-                # spend the whole timeout waiting for controls that this Qt
-                # build may never expose.
-                ui_timeout = self._UIA_PROBE_TIMEOUT if timeout is None else min(
-                    max(0.0, timeout), self._UIA_PROBE_TIMEOUT
-                )
-                dialog = self._file_dialog(action, ui_timeout)
-            filename = self._wait_for(
-                lambda: self._file_name_edit(dialog),
-                "file-name field",
-                timeout=self._UIA_PROBE_TIMEOUT,
-            )
-            self._set_text(filename, str(Path(filepath)), "file name")
-            button_key = "open_button" if action == "open" else "save_button"
-            button = self._control(
-                dialog,
-                _LOCATORS[button_key],
-                f"{action} file button",
-                timeout=self._UIA_PROBE_TIMEOUT,
-            )
-            self._invoke(button, f"{action} file button")
-            return
-        except _UiaAmbiguousError:
-            raise
-        except XFLRGuiError as ui_error:
-            # Qt's file dialog can expose a top-level window without exposing
-            # its child edit/button patterns. Its focused filename field is
-            # still deterministic keyboard input, and remains coordinate-free.
-            try:
-                remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
-                if dialog is None:
-                    dialog = self._wait_for(
-                        lambda: self._file_dialog_window(action),
-                        f"{action} file dialog",
-                        min(remaining if remaining is not None else 2.0, 2.0),
-                    )
-                self._complete_file_dialog_keyboard(dialog, filepath)
-                return
-            except XFLRGuiError as dialog_error:
-                if dialog is None:
-                    raise _FileDialogNotFoundError(
-                        f"Timed out waiting for the {action} file dialog after the XFLR5 command."
-                    ) from ui_error
-                raise XFLRGuiError(
-                    f"The {action} file dialog is visible, but its filename field could not be filled."
-                ) from dialog_error
 
     def _analysis_edit(self, parent: Any, key: str, description: str, fallback_index: int | None = None) -> Any:
         locator = _LOCATORS[key]
@@ -1060,26 +855,10 @@ class WindowsXFLRGui:
 
     def open_project_file(self, filepath: str | Path) -> None:
         self._activate_main()
-        # XFLR5 exposes File -> Open as Ctrl+O. This works even when Qt's menu
-        # items are absent from the UIA tree; the semantic UIA path remains a
-        # fallback for builds with different shortcut configuration.
+        # XFLR5 exposes File -> Open as Ctrl+O. The resulting dialog is then
+        # completed by the legacy-style focused-field sequence below.
         self._send_keys("^o", self._main)
-        try:
-            self._complete_file_dialog(filepath, "open", timeout=3.0)
-            return
-        except _FileDialogNotFoundError:
-            # Only try the semantic menu path if Ctrl+O did not produce any
-            # dialog. If a dialog is already visible, reopening File > Open
-            # would leave the first modal dialog untouched and cause a second
-            # misleading timeout.
-            self._activate_main()
-            self._invoke_menu_path(("File", "Open"))
-            try:
-                self._complete_file_dialog(filepath, "open")
-            except _FileDialogNotFoundError as menu_error:
-                raise XFLRGuiError(
-                    "XFLR5 was focused, but neither Ctrl+O nor the File > Open UIA path opened a file dialog."
-                ) from menu_error
+        self._complete_file_dialog(filepath, "open")
 
     def enter_filename(self, filename: str | Path) -> None:
         # Reuse the complete dialog path so native/Qt dialogs with incomplete
