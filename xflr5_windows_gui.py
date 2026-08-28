@@ -626,6 +626,28 @@ class WindowsXFLRGui:
     def _wait_secondary_window(self, description: str = "XFLR5 dialog", timeout: float | None = 10.0) -> Any:
         return self._wait_for(lambda: self._secondary_window(), description, timeout)
 
+    def _component_dialog(self) -> Any | None:
+        """Find the component editor by its semantic Other/Browse control."""
+
+        # XFLR5 versions differ in how the wing editor is exposed: it may be
+        # a separate top-level window or an MDI/child window below the main
+        # UIA root. Searching for its stable action control handles both.
+        parents = [self._main, *self._visible_windows()]
+        for parent in parents:
+            if parent is None:
+                continue
+            if self._locate_once(parent, _LOCATORS["other_button"]) is not None:
+                return parent
+
+        # Some builds expose the editor window but not its child controls.
+        # Use its accessible title only as a secondary, XFLR5-scoped hint.
+        component_words = ("wing", "elevator", "rudder", "body", "component")
+        for window in self._visible_windows():
+            title = self._window_title(window).casefold()
+            if any(word in title for word in component_words):
+                return window
+        return None
+
     # ---------- deterministic input helpers ----------
 
     def _activate_main(self) -> None:
@@ -1145,7 +1167,7 @@ class WindowsXFLRGui:
     def _open_component_dialog(self, plane: WindowsPlaneRef, part: str) -> Any:
         self._select_plane(plane)
         self._send_keys(f"^{self.key_from_part(part)}", self._main)
-        dialog = self._wait_secondary_window("component dialog")
+        dialog = self._wait_for(self._component_dialog, "component dialog")
         other = self._control(dialog, _LOCATORS["other_button"], "component Other button")
         self._invoke(other, "component Other button")
         return dialog

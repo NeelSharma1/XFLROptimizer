@@ -333,6 +333,35 @@ class WindowsUiAutomationTests(unittest.TestCase):
         send_keys.assert_called_once_with("{SPACE}", control)
         self.assertTrue(adapter.sequence_on)
 
+    def test_component_editor_is_found_when_other_control_is_inside_main_ui(self):
+        other = FakeControl("other", title="Other...", control_type="Button")
+        main_window = FakeParent(other)
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = main_window
+        adapter._app = None
+        adapter._desktop = None
+        adapter._startup_timeout = 1.0
+
+        self.assertIs(adapter._component_dialog(), main_window)
+
+    def test_component_editor_uses_semantic_other_control_after_opening(self):
+        other = FakeControl("other", title="Other...", control_type="Button")
+        main_window = FakeParent(other)
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = main_window
+        adapter._app = None
+        adapter._desktop = None
+        adapter._startup_timeout = 1.0
+
+        with patch.object(adapter, "_select_plane"), patch.object(adapter, "_send_keys") as send_keys, patch.object(
+            adapter, "_invoke"
+        ) as invoke:
+            result = adapter._open_component_dialog(WindowsPlaneRef(0, "Plane 1"), "wing")
+
+        self.assertIs(result, main_window)
+        send_keys.assert_called_once_with("^w", main_window)
+        invoke.assert_called_once_with(other, "component Other button")
+
 
 if __name__ == "__main__":
     unittest.main()
