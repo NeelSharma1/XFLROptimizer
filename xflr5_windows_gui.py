@@ -29,12 +29,14 @@ try:
     from pywinauto import Desktop
     from pywinauto.application import Application
     from pywinauto.keyboard import send_keys
+    from pywinauto.uia_defines import NoPatternInterfaceError
 
     _UIA_IMPORT_ERROR = None
 except Exception as error:  # Importing the XML-only portions must work off Windows.
     Desktop = None
     Application = None
     send_keys = None
+    NoPatternInterfaceError = type("NoPatternInterfaceError", (Exception,), {})
     _UIA_IMPORT_ERROR = error
 
 
@@ -652,12 +654,24 @@ class WindowsXFLRGui:
     @staticmethod
     def _invoke(control: Any, description: str) -> None:
         invoke = getattr(control, "invoke", None)
-        if not callable(invoke):
-            raise XFLRGuiError(f"{description} does not expose the UIA Invoke pattern.")
+        invoke_error: Exception | None = None
         try:
-            invoke()
+            if callable(invoke):
+                invoke()
+                return
         except Exception as error:
-            raise XFLRGuiError(f"Could not invoke {description} through UI Automation.") from error
+            invoke_error = error
+
+        # Qt controls sometimes advertise an Invoke method even though the
+        # underlying UIA Invoke pattern is unavailable. A focused Enter key is
+        # the deterministic equivalent for buttons and menu items.
+        try:
+            WindowsXFLRGui._send_keys("{ENTER}", control)
+            return
+        except XFLRGuiError as keyboard_error:
+            if invoke_error is None:
+                invoke_error = keyboard_error
+            raise XFLRGuiError(f"Could not activate {description} through UI Automation or keyboard fallback.") from invoke_error
 
     @staticmethod
     def _set_text(control: Any, value: str, description: str) -> None:
@@ -670,13 +684,13 @@ class WindowsXFLRGui:
                     return
                 except Exception as error:
                     setter_error = error
-            control.set_focus()
-            send_keys("^a")
-            send_keys(value)
+            WindowsXFLRGui._send_keys("^a", control)
+            WindowsXFLRGui._send_keys(value)
+            return
         except Exception as error:
             if setter_error is not None:
                 error = setter_error
-            raise XFLRGuiError(f"Could not set {description} through UI Automation.") from error
+            raise XFLRGuiError(f"Could not set {description} through UI Automation or keyboard fallback.") from error
 
     @staticmethod
     def _send_keys(keys: str, target: Any | None = None) -> None:
@@ -928,15 +942,28 @@ class WindowsXFLRGui:
         for method_name in ("get_toggle_state", "get_check_state"):
             method = getattr(control, method_name, None)
             if callable(method):
-                state = method()
-                break
+                try:
+                    state = method()
+                    break
+                except Exception:
+                    # The control may expose a state method while omitting the
+                    # corresponding UIA Toggle pattern. Keyboard fallback
+                    # below remains usable in that case.
+                    continue
         if state in (1, True, "1", "on", "On", "checked", "Checked"):
             self.sequence_on = True
             return
         toggle = getattr(control, "toggle", None)
-        if not callable(toggle):
-            raise XFLRGuiError("The sequence-analysis control does not expose the UIA Toggle pattern.")
-        toggle()
+        try:
+            if callable(toggle):
+                toggle()
+            else:
+                raise NoPatternInterfaceError()
+        except Exception:
+            # Space activates a focused checkbox/button without relying on
+            # TogglePattern. This is also the fallback for Qt controls that
+            # expose a toggle method but reject it at invocation time.
+            self._send_keys("{SPACE}", control)
         self.sequence_on = True
 
     def dump_uia_tree(self, parent: Any | None = None, max_depth: int = 8) -> list[dict[str, Any]]:
@@ -999,10 +1026,10 @@ class WindowsXFLRGui:
                 ) from menu_error
 
     def enter_filename(self, filename: str | Path) -> None:
-        dialog = self._wait_secondary_window("file dialog")
-        filename_control = self._control(dialog, _LOCATORS["file_name_edit"], "file-name field")
-        self._set_text(filename_control, str(Path(filename)), "file name")
-        self._send_keys("{ENTER}", dialog)
+        # Reuse the complete dialog path so native/Qt dialogs with incomplete
+        # UIA trees receive the same keyboard fallback as every other file
+        # operation.
+        self._complete_file_dialog(filename, "open")
 
     def _plane_tree(self) -> Any:
         return self._control(self._main, UiaLocator("Tree"), "XFLR5 object tree")
@@ -1046,6 +1073,28 @@ class WindowsXFLRGui:
                 items = direct_items
         return items
 
+    def _select_tree_item(self, item: Any, description: str) -> Any:
+        """Select a UIA tree item, falling back to deterministic focus."""
+
+        selector = getattr(item, "select", None)
+        if callable(selector):
+            try:
+                selector()
+                return item
+            except Exception as selection_error:
+                try:
+                    item.set_focus()
+                    return item
+                except Exception as focus_error:
+                    raise XFLRGuiError(
+                        f"Could not select {description} through UI Automation or keyboard focus fallback."
+                    ) from selection_error
+        try:
+            item.set_focus()
+            return item
+        except Exception as error:
+            raise XFLRGuiError(f"Could not focus {description} through UI Automation.") from error
+
     def _select_plane(self, plane: WindowsPlaneRef) -> Any:
         items = self._plane_items()
         if plane.index < 0:
@@ -1060,11 +1109,7 @@ class WindowsXFLRGui:
                     f"found {len(matches)} exact match(es)."
                 )
             item = matches[0]
-        selector = getattr(item, "select", None)
-        if callable(selector):
-            selector()
-        else:
-            item.set_focus()
+        self._select_tree_item(item, f"plane {plane.name!r}")
         self._last_plane = plane
         return item
 
@@ -1216,11 +1261,7 @@ class WindowsXFLRGui:
         start_button = self._control(self._main, _LOCATORS["start_analysis"], "start-analysis button")
         self._invoke(start_button, "start-analysis button")
         analysis_item = self._wait_for_analysis(name, plane, wait_seconds)
-        selector = getattr(analysis_item, "select", None)
-        if callable(selector):
-            selector()
-        else:
-            analysis_item.set_focus()
+        self._select_tree_item(analysis_item, f"analysis {name!r}")
         self._invoke_context_item(_LOCATORS["export_results"], "export-results menu item")
         self._complete_file_dialog(results_out, "save")
         self._wait_for(lambda: Path(results_out).is_file() or None, f"analysis result {results_out}", wait_seconds)

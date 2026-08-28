@@ -4,7 +4,7 @@ from unittest.mock import Mock, call, patch
 
 import Revamped_XFLRPlaneScript as application
 from xflr5_core import XFLRGuiError
-from xflr5_windows_gui import UiaLocator, WindowsPlaneRef, WindowsXFLRGui
+from xflr5_windows_gui import NoPatternInterfaceError, UiaLocator, WindowsPlaneRef, WindowsXFLRGui
 
 
 class FakeElementInfo:
@@ -21,6 +21,7 @@ class FakeControl:
         self.auto_id = auto_id
         self.invoked = False
         self.text = None
+        self.focused = False
 
     def invoke(self):
         self.invoked = True
@@ -30,6 +31,35 @@ class FakeControl:
 
     def window_text(self):
         return self.title
+
+    def set_focus(self):
+        self.focused = True
+
+
+class SelectionPatternMissingControl(FakeControl):
+    def select(self):
+        raise NoPatternInterfaceError()
+
+    def set_focus(self):
+        self.focused = True
+
+
+class InvokePatternMissingControl(FakeControl):
+    def invoke(self):
+        raise NoPatternInterfaceError()
+
+
+class EditPatternMissingControl(FakeControl):
+    def set_edit_text(self, _value):
+        raise NoPatternInterfaceError()
+
+
+class TogglePatternMissingControl(FakeControl):
+    def get_toggle_state(self):
+        raise NoPatternInterfaceError()
+
+    def toggle(self):
+        raise NoPatternInterfaceError()
 
 
 class FakeParent:
@@ -107,6 +137,24 @@ class WindowsUiAutomationTests(unittest.TestCase):
         WindowsXFLRGui._invoke(control, "Analyze button")
 
         self.assertTrue(control.invoked)
+
+    def test_button_action_falls_back_to_enter_when_invoke_pattern_is_missing(self):
+        control = InvokePatternMissingControl("button", title="Analyze")
+
+        with patch("xflr5_windows_gui.send_keys") as send_keys:
+            WindowsXFLRGui._invoke(control, "Analyze button")
+
+        self.assertTrue(control.focused)
+        send_keys.assert_called_once_with("{ENTER}")
+
+    def test_text_entry_falls_back_to_keyboard_when_value_pattern_is_missing(self):
+        control = EditPatternMissingControl("edit", title="Speed", control_type="Edit")
+
+        with patch("xflr5_windows_gui.send_keys") as send_keys:
+            WindowsXFLRGui._set_text(control, "70", "speed")
+
+        self.assertTrue(control.focused)
+        self.assertEqual(send_keys.call_args_list, [call("^a"), call("70")])
 
     def test_legacy_plane_coordinates_are_replaced_by_a_named_reference(self):
         reference = WindowsPlaneRef(index=2, name="Test Plane")
@@ -261,6 +309,29 @@ class WindowsUiAutomationTests(unittest.TestCase):
                 adapter.open_project_file(Path("project.xfl"))
 
         invoke_menu.assert_not_called()
+
+    def test_plane_selection_falls_back_to_focus_when_selection_pattern_is_missing(self):
+        item = SelectionPatternMissingControl("plane", title="Plane 1", control_type="TreeItem")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._plane_items = Mock(return_value=[item])
+
+        result = adapter._select_plane(WindowsPlaneRef(0, "Plane 1"))
+
+        self.assertIs(result, item)
+        self.assertTrue(item.focused)
+        self.assertEqual(adapter._last_plane, WindowsPlaneRef(0, "Plane 1"))
+
+    def test_sequence_toggle_falls_back_to_space_when_toggle_pattern_is_missing(self):
+        control = TogglePatternMissingControl("toggle", title="Sequence", control_type="CheckBox")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = FakeWindow(1234, "Project")
+        adapter._control = Mock(return_value=control)
+
+        with patch.object(adapter, "_send_keys") as send_keys:
+            adapter._toggle_sequence()
+
+        send_keys.assert_called_once_with("{SPACE}", control)
+        self.assertTrue(adapter.sequence_on)
 
 
 if __name__ == "__main__":
