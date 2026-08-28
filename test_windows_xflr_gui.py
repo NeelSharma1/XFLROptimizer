@@ -239,6 +239,29 @@ class WindowsUiAutomationTests(unittest.TestCase):
             ],
         )
 
+    def test_file_dialog_search_does_not_consume_optimizer_picker(self):
+        optimizer_picker = FakeWindow(9999, "Select XFLR5 optimizer configuration")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = FakeWindow(1234, "Project")
+        adapter._app = Mock()
+        adapter._app.windows.return_value = []
+        adapter._desktop = FakeDesktop(optimizer_picker)
+        adapter._process_id = 1234
+
+        self.assertIsNone(adapter._file_dialog_window("open"))
+
+    def test_project_open_does_not_open_a_second_dialog_after_a_visible_dialog_error(self):
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = FakeWindow(1234, "Project")
+
+        with patch.object(adapter, "_send_keys"), patch.object(adapter, "_activate_main"), patch.object(
+            adapter, "_complete_file_dialog", side_effect=XFLRGuiError("dialog input failed")
+        ), patch.object(adapter, "_invoke_menu_path") as invoke_menu:
+            with self.assertRaisesRegex(XFLRGuiError, "dialog input failed"):
+                adapter.open_project_file(Path("project.xfl"))
+
+        invoke_menu.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
