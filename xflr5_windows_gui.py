@@ -346,7 +346,11 @@ class WindowsXFLRGui:
     """
 
     _WINDOW_TITLE_RE = r"(?i).*xflr5.*"
-    _POLL_INTERVAL = 0.10
+    # These are only input/event-queue settle intervals. Actual readiness is
+    # still determined by UIA polling in _wait_for.
+    _POLL_INTERVAL = 0.02
+    _INPUT_SETTLE_DELAY = 0.01
+    _UIA_PROBE_TIMEOUT = 0.20
 
     def __init__(
         self,
@@ -719,8 +723,17 @@ class WindowsXFLRGui:
         try:
             if target is not None:
                 target.set_focus()
-                time.sleep(0.05)
-            send_keys(keys)
+                time.sleep(WindowsXFLRGui._INPUT_SETTLE_DELAY)
+            # Spaces must be explicitly enabled for Windows paths and names.
+            # VK_PACKET is not handled consistently by Qt edit controls, so
+            # use ordinary virtual-key input for the ASCII values used here.
+            send_keys(
+                keys,
+                with_spaces=True,
+                with_tabs=True,
+                with_newlines=True,
+                vk_packet=False,
+            )
         except Exception as error:
             raise XFLRGuiError(f"Could not send deterministic keyboard sequence {keys!r}.") from error
 
@@ -758,7 +771,10 @@ class WindowsXFLRGui:
             # search every desktop window here: the optimizer's own Tk picker,
             # a terminal, or another application's dialog can otherwise be
             # mistaken for XFLR5's dialog.
-            for window in self._visible_windows():
+            parents = [self._main, *self._visible_windows()]
+            for window in parents:
+                if window is None:
+                    continue
                 if self._locate_once(window, _LOCATORS["file_name_edit"]) is not None and self._locate_once(
                     window, locator
                 ) is not None:
@@ -800,7 +816,10 @@ class WindowsXFLRGui:
         return (
             title in {"file dialog", "file picker"}
             or any(word in title for word in title_words)
-            or class_name in {"#32770", "QFileDialog", "Qt5QWindowIcon", "Qt6QWindowIcon"}
+            # Qt5QWindowIcon/Qt6QWindowIcon are generic classes used by the
+            # main window and component editor too; they are not sufficient
+            # evidence on their own.
+            or class_name in {"#32770", "QFileDialog"}
         )
 
     def _file_dialog_window(self, action: str) -> Any | None:
@@ -810,13 +829,16 @@ class WindowsXFLRGui:
         # opened by the optimizer is intentionally a separate UI and must not
         # be consumed by the XFLR5 adapter.
         same_process_windows = self._visible_windows()
+        if self._main is not None:
+            if self._locate_once(self._main, _LOCATORS["file_name_edit"]) is not None:
+                locator = _LOCATORS["open_button"] if action == "open" else _LOCATORS["save_button"]
+                if self._locate_once(self._main, locator) is not None:
+                    return self._main
         candidates: list[Any] = []
         for window in same_process_windows:
             if self._looks_like_file_dialog(window, action):
                 return window
             candidates.append(window)
-        if len(candidates) == 1:
-            return candidates[0]
 
         # A native Windows common dialog can occasionally be hosted by the
         # shell rather than by the Qt process that requested it. Consider that
@@ -832,6 +854,11 @@ class WindowsXFLRGui:
                 continue
             if self._looks_like_file_dialog(window, action):
                 return window
+        # Only use an unlabelled XFLR5 secondary window as a last resort. The
+        # actual native dialog may be outside XFLR5's PID while the component
+        # editor is still visible, so this fallback must not win first.
+        if len(candidates) == 1:
+            return candidates[0]
         return None
 
     def _file_name_edit(self, dialog: Any) -> Any | None:
@@ -890,16 +917,23 @@ class WindowsXFLRGui:
                 # Give UIA controls a brief opportunity to appear, but do not
                 # spend the whole timeout waiting for controls that this Qt
                 # build may never expose.
-                ui_timeout = 0.75 if timeout is None else min(max(0.0, timeout), 0.75)
+                ui_timeout = self._UIA_PROBE_TIMEOUT if timeout is None else min(
+                    max(0.0, timeout), self._UIA_PROBE_TIMEOUT
+                )
                 dialog = self._file_dialog(action, ui_timeout)
             filename = self._wait_for(
                 lambda: self._file_name_edit(dialog),
                 "file-name field",
-                timeout=0.75,
+                timeout=self._UIA_PROBE_TIMEOUT,
             )
             self._set_text(filename, str(Path(filepath)), "file name")
             button_key = "open_button" if action == "open" else "save_button"
-            button = self._control(dialog, _LOCATORS[button_key], f"{action} file button", timeout=0.75)
+            button = self._control(
+                dialog,
+                _LOCATORS[button_key],
+                f"{action} file button",
+                timeout=self._UIA_PROBE_TIMEOUT,
+            )
             self._invoke(button, f"{action} file button")
             return
         except _UiaAmbiguousError:

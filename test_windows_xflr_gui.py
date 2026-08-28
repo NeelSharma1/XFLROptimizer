@@ -145,7 +145,13 @@ class WindowsUiAutomationTests(unittest.TestCase):
             WindowsXFLRGui._invoke(control, "Analyze button")
 
         self.assertTrue(control.focused)
-        send_keys.assert_called_once_with("{ENTER}")
+        send_keys.assert_called_once_with(
+            "{ENTER}",
+            with_spaces=True,
+            with_tabs=True,
+            with_newlines=True,
+            vk_packet=False,
+        )
 
     def test_text_entry_falls_back_to_keyboard_when_value_pattern_is_missing(self):
         control = EditPatternMissingControl("edit", title="Speed", control_type="Edit")
@@ -154,7 +160,16 @@ class WindowsUiAutomationTests(unittest.TestCase):
             WindowsXFLRGui._set_text(control, "70", "speed")
 
         self.assertTrue(control.focused)
-        self.assertEqual(send_keys.call_args_list, [call("^a"), call("70")])
+        expected_kwargs = {
+            "with_spaces": True,
+            "with_tabs": True,
+            "with_newlines": True,
+            "vk_packet": False,
+        }
+        self.assertEqual(
+            send_keys.call_args_list,
+            [call("^a", **expected_kwargs), call("70", **expected_kwargs)],
+        )
 
     def test_legacy_plane_coordinates_are_replaced_by_a_named_reference(self):
         reference = WindowsPlaneRef(index=2, name="Test Plane")
@@ -297,6 +312,18 @@ class WindowsUiAutomationTests(unittest.TestCase):
         adapter._process_id = 1234
 
         self.assertIsNone(adapter._file_dialog_window("open"))
+
+    def test_native_file_dialog_wins_over_visible_component_editor(self):
+        component_editor = FakeWindow(1234, "Wing Design")
+        native_dialog = FakeWindow(9999, "Open")
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = FakeWindow(1234, "Project")
+        adapter._app = Mock()
+        adapter._app.windows.return_value = []
+        adapter._desktop = FakeDesktop(component_editor, native_dialog)
+        adapter._process_id = 1234
+
+        self.assertIs(adapter._file_dialog_window("open"), native_dialog)
 
     def test_project_open_does_not_open_a_second_dialog_after_a_visible_dialog_error(self):
         adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
