@@ -5,8 +5,11 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import Revamped_XFLRPlaneScript as application
 from Revamped_XFLRPlaneScript import (
+    AnalysisSpec,
     AircraftCandidate,
     AircraftOptimizer,
     ConstraintError,
@@ -120,6 +123,69 @@ class RevampedXflrTests(unittest.TestCase):
             result = optimizer.optimize((0, 0), optimizer.grid_candidates(["N22"]))
             self.assertEqual(result.records[0].status, "failed")
             self.assertIn("Realized span 60 exceeds limit 50", result.records[0].message)
+
+    def test_optimizer_configuration_file_loads_settings_without_terminal_prompts(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            project = root / "project.xfl"
+            project.write_text("project", encoding="utf-8")
+            foil_directory = root / "foils"
+            foil_directory.mkdir()
+            (foil_directory / "n22.dat").write_text("N22\n0 0\n", encoding="utf-8")
+            config = root / "optimizer.txt"
+            config.write_text(
+                "\n".join(
+                    (
+                        "project=project.xfl",
+                        "foil_directory=foils",
+                        "airfoils=N22",
+                        "part=elevator",
+                        "plane_index=2",
+                        "spans=48, 60",
+                        "span_limit=60",
+                        "speed=55",
+                        "sweep_start=-5",
+                        "sweep_end=10",
+                        "sweep_increment=0.25",
+                        "fixed_angle=1",
+                        "wait_seconds=3",
+                        "metric=CL/CD",
+                        "maximize=no",
+                        "clear_polars=false",
+                        "output=results",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            settings = application._settings_from_optimizer_config(config)
+
+        self.assertEqual(settings["project"], project)
+        self.assertEqual(settings["foil_directory"], foil_directory)
+        self.assertEqual(settings["airfoils"], ["N22"])
+        self.assertEqual(settings["part"], "elevator")
+        self.assertEqual(settings["plane_index"], 2)
+        self.assertEqual(settings["spans"], ["48", "60"])
+        self.assertEqual(settings["span_limit"], "60")
+        self.assertEqual(settings["analysis"], AnalysisSpec(55.0, -5.0, 10.0, 0.25, 1.0, 3.0))
+        self.assertFalse(settings["maximize"])
+        self.assertFalse(settings["clear_polars"])
+        self.assertEqual(settings["output"], root / "results")
+
+    def test_cancelled_configuration_picker_uses_terminal_settings(self):
+        terminal_settings = {"project": Path("terminal.xfl")}
+        with patch.object(application, "_select_optimizer_config_file", return_value=None), patch.object(
+            application, "_interactive_settings_terminal", return_value=terminal_settings
+        ) as terminal:
+            self.assertIs(application._interactive_settings(), terminal_settings)
+        terminal.assert_called_once_with()
+
+    def test_configuration_parser_rejects_unknown_options(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config = Path(temporary_directory) / "optimizer.txt"
+            config.write_text("unknown=value\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Unknown optimizer configuration option"):
+                application._read_optimizer_config(config)
 
 
 if __name__ == "__main__":

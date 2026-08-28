@@ -387,7 +387,220 @@ def _prompt_existing_path(label: str, directory: bool = False) -> Path:
         print(f"That {kind} does not exist: {path}")
 
 
-def _interactive_settings() -> dict[str, object] | None:
+_CONFIG_DEFAULTS = {
+    "part": "wing",
+    "plane_index": "0",
+    "spans": "",
+    "span_limit": "",
+    "speed": "70.0",
+    "sweep_start": "-13.0",
+    "sweep_end": "13.0",
+    "sweep_increment": "0.5",
+    "fixed_angle": "0.0",
+    "wait_seconds": "20.0",
+    "metric": "CL/CD",
+    "maximize": "yes",
+    "clear_polars": "yes",
+    "output": "optimization_output",
+}
+_CONFIG_REQUIRED = ("project", "foil_directory", "airfoils")
+_CONFIG_ALIASES = {
+    "project_file": "project",
+    "foil_dir": "foil_directory",
+    "airfoil_dir": "foil_directory",
+    "airfoils_to_test": "airfoils",
+    "plane_number": "plane_index",
+    "span_values": "spans",
+    "maximum_span": "span_limit",
+    "max_span": "span_limit",
+    "delete_polars": "clear_polars",
+}
+_CONFIG_KEYS = set(_CONFIG_DEFAULTS) | set(_CONFIG_REQUIRED)
+
+
+def _select_optimizer_config_file() -> Path | None:
+    """Open a standalone optimizer-config picker; return None on cancel/close."""
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        print("The configuration file dialog is unavailable; using terminal entry instead.")
+        return None
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="Select XFLR5 optimizer configuration (Cancel for terminal input)",
+            initialdir=str(Path.cwd()),
+            filetypes=(("Text files", "*.txt"), ("All files", "*.*")),
+        )
+    except Exception:
+        print("The configuration file dialog could not be opened; using terminal entry instead.")
+        return None
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+    if not selected:
+        print("No configuration file selected; using terminal entry instead.")
+        return None
+    return Path(selected).expanduser()
+
+
+def _read_optimizer_config(config_file: str | Path) -> dict[str, str]:
+    """Read one ``key=value`` optimizer option per non-empty configuration line."""
+
+    path = Path(config_file).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ValueError(f"Optimizer configuration {path} is not a UTF-8 text file.") from error
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(
+                f"Optimizer configuration line {line_number} must use key=value format: {raw_line!r}."
+            )
+        key, value = (part.strip() for part in line.split("=", maxsplit=1))
+        normalized_key = _CONFIG_ALIASES.get(key.lower().replace("-", "_"), key.lower().replace("-", "_"))
+        if normalized_key not in _CONFIG_KEYS:
+            supported = ", ".join(sorted(_CONFIG_KEYS))
+            raise ValueError(f"Unknown optimizer configuration option {key!r} on line {line_number}. Use: {supported}.")
+        if normalized_key in values:
+            raise ValueError(f"Optimizer configuration option {normalized_key!r} is repeated on line {line_number}.")
+        values[normalized_key] = value
+    missing = [key for key in _CONFIG_REQUIRED if not values.get(key, "").strip()]
+    if missing:
+        raise ValueError(f"Optimizer configuration is missing required option(s): {', '.join(missing)}.")
+    return values
+
+
+def _config_path(values: dict[str, str], key: str, config_file: Path, directory: bool = False) -> Path:
+    value = values.get(key, "").strip()
+    if not value:
+        raise ValueError(f"Optimizer configuration option {key!r} cannot be blank.")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = config_file.parent / path
+    expected = path.is_dir() if directory else path.is_file()
+    if not expected:
+        kind = "directory" if directory else "file"
+        raise ValueError(f"Optimizer configuration option {key!r} does not identify an existing {kind}: {path}")
+    return path
+
+
+def _config_float(values: dict[str, str], key: str) -> float:
+    try:
+        return float(values.get(key, _CONFIG_DEFAULTS[key]))
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"Optimizer configuration option {key!r} must be a number.") from error
+
+
+def _config_int(values: dict[str, str], key: str) -> int:
+    try:
+        parsed = int(values.get(key, _CONFIG_DEFAULTS[key]))
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"Optimizer configuration option {key!r} must be a non-negative whole number.") from error
+    if parsed < 0:
+        raise ValueError(f"Optimizer configuration option {key!r} must be non-negative.")
+    return parsed
+
+
+def _config_bool(values: dict[str, str], key: str) -> bool:
+    value = values.get(key, _CONFIG_DEFAULTS[key]).strip().lower()
+    if value in {"y", "yes", "true", "1", "on"}:
+        return True
+    if value in {"n", "no", "false", "0", "off"}:
+        return False
+    raise ValueError(f"Optimizer configuration option {key!r} must be yes/no, true/false, or 1/0.")
+
+
+def _config_length(value: str, key: str, optional: bool = False) -> str | None:
+    value = value.strip()
+    if not value and optional:
+        return None
+    try:
+        if convert_length(value, 1.0) <= 0:
+            raise LengthUnitError("length must be positive")
+    except LengthUnitError as error:
+        raise ValueError(f"Optimizer configuration option {key!r} is invalid: {error}") from error
+    return value
+
+
+def _settings_from_optimizer_config(config_file: str | Path) -> dict[str, object]:
+    """Convert a selected optimizer text configuration into normal run settings."""
+
+    config_path = Path(config_file).expanduser()
+    values = _read_optimizer_config(config_path)
+    project = _config_path(values, "project", config_path)
+    foil_directory = _config_path(values, "foil_directory", config_path, directory=True)
+    available = sorted(airfoils_in_directory(foil_directory))
+    if not available:
+        raise ValueError(f"No .dat airfoils were found in {foil_directory}.")
+
+    selected_text = values["airfoils"].strip()
+    selected = available if selected_text.lower() == "all" else _parse_csv_values(selected_text)
+    missing = sorted(set(selected) - set(available))
+    if not selected or missing:
+        unknown = ", ".join(missing) if missing else "no airfoils"
+        raise ValueError(f"Optimizer configuration airfoils are invalid: {unknown}.")
+
+    part = values.get("part", _CONFIG_DEFAULTS["part"]).strip().lower()
+    if part not in {"wing", "elevator", "rudder"}:
+        raise ValueError("Optimizer configuration option 'part' must be wing, elevator, or rudder.")
+    plane_index = _config_int(values, "plane_index")
+
+    spans_text = values.get("spans", _CONFIG_DEFAULTS["spans"])
+    spans: list[str | None] = _parse_csv_values(spans_text) or [None]
+    spans = [_config_length(value, "spans") if value is not None else None for value in spans]
+    span_limit = _config_length(values.get("span_limit", _CONFIG_DEFAULTS["span_limit"]), "span_limit", optional=True)
+
+    analysis = AnalysisSpec(
+        speed=_config_float(values, "speed"),
+        sweep_start=_config_float(values, "sweep_start"),
+        sweep_end=_config_float(values, "sweep_end"),
+        sweep_increment=_config_float(values, "sweep_increment"),
+        fixed_angle=_config_float(values, "fixed_angle"),
+        wait_seconds=_config_float(values, "wait_seconds"),
+    )
+    metric = values.get("metric", _CONFIG_DEFAULTS["metric"]).strip() or _CONFIG_DEFAULTS["metric"]
+    output_value = values.get("output", _CONFIG_DEFAULTS["output"]).strip()
+    if not output_value:
+        raise ValueError("Optimizer configuration option 'output' cannot be blank.")
+    output = Path(output_value).expanduser()
+    if not output.is_absolute():
+        output = config_path.parent / output
+
+    print(f"Loaded optimizer configuration from {config_path}.")
+    print(f"This will evaluate up to {len(selected) * len(spans)} candidate(s).")
+    return {
+        "project": project,
+        "foil_directory": foil_directory,
+        "airfoils": selected,
+        "part": part,
+        "plane_index": plane_index,
+        "spans": spans,
+        "span_limit": span_limit,
+        "analysis": analysis,
+        "metric": metric,
+        "maximize": _config_bool(values, "maximize"),
+        "clear_polars": _config_bool(values, "clear_polars"),
+        "output": output,
+    }
+
+
+def _interactive_settings_terminal() -> dict[str, object] | None:
     """Collect a complete run configuration from the terminal."""
 
     print("\nXFLR5 constrained aircraft optimizer")
@@ -468,6 +681,16 @@ def _interactive_settings() -> dict[str, object] | None:
         "clear_polars": clear_polars,
         "output": output,
     }
+
+
+def _interactive_settings() -> dict[str, object] | None:
+    """Select an optimizer configuration file, or use the existing terminal interface on cancel."""
+
+    print("\nSelect an optimizer configuration text file (Cancel or close for terminal input).")
+    config_file = _select_optimizer_config_file()
+    if config_file is not None:
+        return _settings_from_optimizer_config(config_file)
+    return _interactive_settings_terminal()
 
 
 def _parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
