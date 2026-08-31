@@ -333,17 +333,14 @@ class WindowsUiAutomationTests(unittest.TestCase):
         adapter._desktop = None
         adapter._startup_timeout = 1.0
 
-        with patch.object(adapter, "_select_plane"), patch.object(adapter, "_send_keys") as send_keys, patch.object(
-            adapter, "_invoke"
-        ) as invoke:
+        with patch.object(adapter, "_select_plane"), patch.object(adapter, "_send_keys") as send_keys:
             result = adapter._open_component_dialog(WindowsPlaneRef(0, "Plane 1"), "wing", xml_tab_count=2)
 
         self.assertIs(result, main_window)
         self.assertEqual(
             send_keys.call_args_list,
-            [call("^w", main_window), call("{TAB}"), call("{TAB}"), call("{ENTER}")],
+            [call("^w", main_window), call("{ENTER}"), call("{TAB}"), call("{TAB}"), call("{ENTER}")],
         )
-        invoke.assert_called_once_with(other, "component Other button")
         self.assertTrue(other.focused)
 
     def test_component_xml_action_uses_the_requested_tab_count(self):

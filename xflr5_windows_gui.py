@@ -988,13 +988,15 @@ class WindowsXFLRGui:
         self._send_keys(f"^{self.key_from_part(part)}", self._main)
         dialog = self._wait_for(self._component_dialog, "component dialog")
         other = self._control(dialog, _LOCATORS["other_button"], "component Other button")
-        # Match the legacy click behavior: the Other control is focused before
-        # it is activated, so the subsequent Tab sequence starts from it/menu.
+        # Focus and activate the control with the keyboard. Calling UIA
+        # InvokePattern here can block while Qt processes the popup; Enter
+        # preserves the legacy click behavior and lets Tab navigation start
+        # immediately after the popup is opened.
         try:
             other.set_focus()
         except Exception:
             pass
-        self._invoke(other, "component Other button")
+        self._send_keys("{ENTER}")
         self._select_component_xml_action(xml_tab_count)
         return dialog
 
