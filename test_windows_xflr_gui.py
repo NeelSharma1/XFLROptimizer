@@ -284,7 +284,7 @@ class WindowsUiAutomationTests(unittest.TestCase):
         with patch("xflr5_windows_gui.time.sleep") as sleep, patch.object(adapter, "_send_keys") as send_keys:
             adapter._complete_file_dialog(Path("C:/work/project.xfl"), "open")
 
-        sleep.assert_called_once_with(3.0)
+        sleep.assert_called_once_with(0.1)
         self.assertEqual(
             send_keys.call_args_list,
             [call("C:/work/project.xfl"), call("{ENTER}")],
@@ -336,11 +336,23 @@ class WindowsUiAutomationTests(unittest.TestCase):
         with patch.object(adapter, "_select_plane"), patch.object(adapter, "_send_keys") as send_keys, patch.object(
             adapter, "_invoke"
         ) as invoke:
-            result = adapter._open_component_dialog(WindowsPlaneRef(0, "Plane 1"), "wing")
+            result = adapter._open_component_dialog(WindowsPlaneRef(0, "Plane 1"), "wing", xml_tab_count=2)
 
         self.assertIs(result, main_window)
-        send_keys.assert_called_once_with("^w", main_window)
+        self.assertEqual(
+            send_keys.call_args_list,
+            [call("^w", main_window), call("{TAB}"), call("{TAB}"), call("{ENTER}")],
+        )
         invoke.assert_called_once_with(other, "component Other button")
+        self.assertTrue(other.focused)
+
+    def test_component_xml_action_uses_the_requested_tab_count(self):
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+
+        with patch.object(adapter, "_send_keys") as send_keys:
+            adapter._select_component_xml_action(1)
+
+        self.assertEqual(send_keys.call_args_list, [call("{TAB}"), call("{ENTER}")])
 
 
 if __name__ == "__main__":

@@ -347,9 +347,9 @@ class WindowsXFLRGui:
     _POLL_INTERVAL = 0.02
     _INPUT_SETTLE_DELAY = 0.01
     # XFLR5 opens a modal native/Qt file dialog after the triggering action.
-    # The legacy adapter gives that dialog a fixed opportunity to open and
-    # relies on its default focus being in the filename field.
-    _FILE_DIALOG_OPEN_DELAY = 3.0
+    # The legacy adapter gives that dialog a short fixed opportunity to open
+    # and relies on its default focus being in the filename field.
+    _FILE_DIALOG_OPEN_DELAY = 0.1
 
     def __init__(
         self,
@@ -861,9 +861,8 @@ class WindowsXFLRGui:
         self._complete_file_dialog(filepath, "open")
 
     def enter_filename(self, filename: str | Path) -> None:
-        # Reuse the complete dialog path so native/Qt dialogs with incomplete
-        # UIA trees receive the same keyboard fallback as every other file
-        # operation.
+        # Reuse the legacy-style focused-field path for every XFLR5 file
+        # dialog. The caller is responsible for having opened the dialog.
         self._complete_file_dialog(filename, "open")
 
     def _plane_tree(self) -> Any:
@@ -977,21 +976,37 @@ class WindowsXFLRGui:
         except KeyError as error:
             raise ValueError(f"Unsupported XFLR part: {part!r}") from error
 
-    def _open_component_dialog(self, plane: WindowsPlaneRef, part: str) -> Any:
+    def _select_component_xml_action(self, tab_count: int) -> None:
+        """Choose the component XML action from the focused Other menu."""
+
+        for _ in range(tab_count):
+            self._send_keys("{TAB}")
+        self._send_keys("{ENTER}")
+
+    def _open_component_dialog(self, plane: WindowsPlaneRef, part: str, xml_tab_count: int) -> Any:
         self._select_plane(plane)
         self._send_keys(f"^{self.key_from_part(part)}", self._main)
         dialog = self._wait_for(self._component_dialog, "component dialog")
         other = self._control(dialog, _LOCATORS["other_button"], "component Other button")
+        # Match the legacy click behavior: the Other control is focused before
+        # it is activated, so the subsequent Tab sequence starts from it/menu.
+        try:
+            other.set_focus()
+        except Exception:
+            pass
         self._invoke(other, "component Other button")
+        self._select_component_xml_action(xml_tab_count)
         return dialog
 
     def export_wing(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
-        self._open_component_dialog(plane, part)
+        # Legacy tab sequence: Other -> Export XML.
+        self._open_component_dialog(plane, part, xml_tab_count=1)
         self._complete_file_dialog(filepath, "save")
         self._wait_for(lambda: Path(filepath).is_file() or None, f"exported component {filepath}")
 
     def import_wing(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
-        self._open_component_dialog(plane, part)
+        # Legacy tab sequence: Other -> Import XML.
+        self._open_component_dialog(plane, part, xml_tab_count=2)
         self._complete_file_dialog(filepath, "open")
 
     def replace_part_from_xml(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
