@@ -351,6 +351,14 @@ class WindowsUiAutomationTests(unittest.TestCase):
 
         self.assertEqual(send_keys.call_args_list, [call("{TAB}"), call("{ENTER}")])
 
+    def test_component_editor_is_closed_with_the_legacy_post_import_sequence(self):
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+
+        with patch.object(adapter, "_send_keys") as send_keys:
+            adapter._finish_component_dialog()
+
+        self.assertEqual(send_keys.call_args_list, [call("{ENTER}"), call("{ENTER}")])
+
 
 if __name__ == "__main__":
     unittest.main()
