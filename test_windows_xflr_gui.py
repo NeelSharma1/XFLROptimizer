@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+import tempfile
 from unittest.mock import Mock, call, patch
 
 import Revamped_XFLRPlaneScript as application
@@ -358,6 +359,18 @@ class WindowsUiAutomationTests(unittest.TestCase):
             adapter._finish_component_dialog()
 
         self.assertEqual(send_keys.call_args_list, [call("{ENTER}"), call("{ENTER}")])
+
+    def test_export_skips_an_existing_destination(self):
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "component.xml"
+            destination.write_text("already exported", encoding="utf-8")
+
+            with patch.object(adapter, "_open_component_dialog") as open_dialog:
+                adapter.export_wing(WindowsPlaneRef(0, "Plane 1"), destination, "wing")
+
+        open_dialog.assert_not_called()
 
 
 if __name__ == "__main__":

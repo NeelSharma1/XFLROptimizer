@@ -1011,12 +1011,15 @@ class WindowsXFLRGui:
         return dialog
 
     def export_wing(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
+        destination = Path(filepath)
+        if destination.is_file():
+            return
         # Legacy tab sequence: Other -> Export XML.
         self._open_component_dialog(plane, part, xml_tab_count=1)
         self._complete_file_dialog(filepath, "save")
         # Post-export sequence: accept/close the wing editor.
         self._finish_component_dialog()
-        self._wait_for(lambda: Path(filepath).is_file() or None, f"exported component {filepath}")
+        self._wait_for(lambda: destination.is_file() or None, f"exported component {filepath}")
 
     def import_wing(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
         # Legacy tab sequence: Other -> Import XML.
