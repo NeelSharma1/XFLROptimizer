@@ -1007,7 +1007,7 @@ class WindowsXFLRGui:
         except Exception:
             pass
         self._send_keys("{ENTER}")
-        # self._select_component_xml_action(xml_tab_count)
+        self._select_component_xml_action(xml_tab_count)
         return dialog
 
     def export_wing(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
