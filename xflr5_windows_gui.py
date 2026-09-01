@@ -1007,7 +1007,7 @@ class WindowsXFLRGui:
         except Exception:
             pass
         self._send_keys("{ENTER}")
-        # self._select_component_xml_action(xml_tab_count)
+        self._select_component_xml_action(xml_tab_count)
         return dialog
 
     def export_wing(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
@@ -1026,18 +1026,19 @@ class WindowsXFLRGui:
         self._open_component_dialog(plane, part, xml_tab_count=2)
         self._complete_file_dialog(filepath, "open")
         # Post-import sequence: accept/close the wing editor.
+        time.sleep(1)
         self._finish_component_dialog()
 
     def replace_part_from_xml(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
         self.import_wing(plane, filepath, part)
-        try:
-            confirmation = self._control_any_window(_LOCATORS["yes_button"], "component replacement confirmation", 2.0)
-        except XFLRGuiError:
-            confirmation = None
-        if confirmation is not None:
-            self._invoke(confirmation, "component replacement confirmation")
-        else:
-            self._send_keys("{ENTER}", self._main)
+        # try:
+        #     confirmation = self._control_any_window(_LOCATORS["yes_button"], "component replacement confirmation", 2.0)
+        # except XFLRGuiError:
+        #     confirmation = None
+        # if confirmation is not None:
+        #     self._invoke(confirmation, "component replacement confirmation")
+        # else:
+        #     self._send_keys("{ENTER}", self._main)
 
     def swap_part_airfoil(
         self,

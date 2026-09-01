@@ -11,3 +11,7 @@ venv/
 # Python generated files
 __pycache__/
 *.py[cod]
+
+# Manually created input file
+
+input.txt
