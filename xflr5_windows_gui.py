@@ -352,7 +352,7 @@ class WindowsXFLRGui:
     # XFLR5 opens a modal native/Qt file dialog after the triggering action.
     # The legacy adapter gives that dialog a short fixed opportunity to open
     # and relies on its default focus being in the filename field.
-    _FILE_DIALOG_OPEN_DELAY = 0.1
+    _FILE_DIALOG_OPEN_DELAY = 0.5
 
     def __init__(
         self,
