@@ -272,7 +272,10 @@ _LOCATORS: dict[str, UiaLocator] = {
     "open_menu": UiaLocator("MenuItem", titles=("Open", "Open Project", "Open Project File")),
     "other_button": UiaLocator("Button", titles=("Other...", "Other", "Browse...")),
     "open_button": UiaLocator("Button", titles=("Open", "Import", "Select")),
-    "save_button": UiaLocator("Button", titles=("Save", "Export", "Save As")),
+    "save_button": UiaLocator(
+        "Button",
+        titles=("Save and Close", "Save & Close", "Save", "Export", "Save As"),
+    ),
     "file_name_edit": UiaLocator(
         "Edit",
         titles=("File name:", "File name", "Filename", "File Name"),
@@ -983,15 +986,16 @@ class WindowsXFLRGui:
             self._send_keys("{TAB}")
         self._send_keys("{ENTER}")
 
-    def _finish_component_dialog(self) -> None:
-        """Accept and close the component editor after its file operation.
+    def _finish_component_dialog(self, dialog: Any) -> None:
+        """Save and close the component editor after its file operation.
 
-        When the file dialog closes, focus returns to the component editor;
-        two Enter presses accept the edit and then exit the editor.
+        The file dialog changes keyboard focus unpredictably when it closes.
+        Resolve the component editor's save control through UI Automation so
+        this action does not depend on whichever control receives focus.
         """
 
-        self._send_keys("{ENTER}")
-        self._send_keys("{ENTER}")
+        save = self._control(dialog, _LOCATORS["save_button"], "component Save and Close button")
+        self._invoke(save, "component Save and Close button")
 
     def _open_component_dialog(self, plane: WindowsPlaneRef, part: str, xml_tab_count: int) -> Any:
         self._select_plane(plane)
@@ -1015,19 +1019,19 @@ class WindowsXFLRGui:
         if destination.is_file():
             return
         # Legacy tab sequence: Other -> Export XML.
-        self._open_component_dialog(plane, part, xml_tab_count=1)
+        dialog = self._open_component_dialog(plane, part, xml_tab_count=1)
         self._complete_file_dialog(filepath, "save")
-        # Post-export sequence: accept/close the wing editor.
-        self._finish_component_dialog()
+        # Post-export action: resolve and invoke the editor's save control.
+        self._finish_component_dialog(dialog)
         self._wait_for(lambda: destination.is_file() or None, f"exported component {filepath}")
 
     def import_wing(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
         # Legacy tab sequence: Other -> Import XML.
-        self._open_component_dialog(plane, part, xml_tab_count=2)
+        dialog = self._open_component_dialog(plane, part, xml_tab_count=2)
         self._complete_file_dialog(filepath, "open")
-        # Post-import sequence: accept/close the wing editor.
+        # Post-import action: resolve and invoke the editor's save control.
         time.sleep(1)
-        self._finish_component_dialog()
+        self._finish_component_dialog(dialog)
 
     def replace_part_from_xml(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
         self.import_wing(plane, filepath, part)
