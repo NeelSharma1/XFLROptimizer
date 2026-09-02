@@ -1030,7 +1030,6 @@ class WindowsXFLRGui:
         dialog = self._open_component_dialog(plane, part, xml_tab_count=2)
         self._complete_file_dialog(filepath, "open")
         # Post-import action: resolve and invoke the editor's save control.
-        time.sleep(1)
         self._finish_component_dialog(dialog)
 
     def replace_part_from_xml(self, plane: WindowsPlaneRef, filepath: str | Path, part: str) -> None:
