@@ -1,0 +1,101 @@
+{
+  "backend": "demo",
+  "output": "optimization_output",
+  "variables": [
+    {"name": "span", "minimum": 44.0, "maximum": 72.0, "initial": 60.0},
+    {"name": "chord_scale", "minimum": 0.75, "maximum": 1.25, "initial": 1.0},
+    {"name": "sweep_deg", "minimum": 0.0, "maximum": 35.0, "initial": 18.0},
+    {"name": "tip_twist_deg", "minimum": -6.0, "maximum": 2.0, "initial": -2.0},
+    {"name": "dihedral_deg", "minimum": 0.0, "maximum": 8.0, "initial": 4.0},
+    {
+      "name": "airfoil",
+      "choices": ["N22", "NACA 2412", "NACA 23012"],
+      "initial": "N22"
+    }
+  ],
+  "objectives": [
+    {
+      "metric": "CL/CD",
+      "goal": "maximize",
+      "weight": 2.0,
+      "scale": 30.0,
+      "sweep": "alpha",
+      "reducer": "max",
+      "conditions": {"alpha": [-2.0, 10.0]},
+      "label": "peak_efficiency"
+    },
+    {
+      "metric": "Lift",
+      "goal": "target",
+      "target": 1800.0,
+      "weight": 1.2,
+      "scale": 500.0,
+      "sweep": "alpha",
+      "reducer": "max",
+      "conditions": {"alpha": [0.0, 8.0]},
+      "label": "lift_target_N"
+    },
+    {
+      "metric": "Drag",
+      "goal": "minimize",
+      "weight": 0.8,
+      "scale": 100.0,
+      "sweep": "alpha",
+      "reducer": "mean",
+      "conditions": {"alpha": [0.0, 8.0]},
+      "label": "mean_drag_N"
+    },
+    {
+      "metric": "Cm alpha",
+      "goal": "target",
+      "target": -0.9,
+      "weight": 1.0,
+      "scale": 0.35,
+      "sweep": "alpha",
+      "reducer": "mean",
+      "conditions": {"alpha": [-4.0, 8.0]},
+      "label": "cm_alpha_per_rad"
+    },
+    {
+      "metric": "Cn beta",
+      "goal": "at_least",
+      "target": 0.18,
+      "weight": 1.0,
+      "scale": 0.18,
+      "sweep": "beta",
+      "reducer": "mean",
+      "hard": true,
+      "label": "directional_stability"
+    }
+  ],
+  "analysis": {
+    "alpha": {"start": -8.0, "end": 12.0, "increment": 1.0, "speed": 70.0, "wait_seconds": 60.0},
+    "beta": {"start": -8.0, "end": 8.0, "increment": 1.0, "speed": 70.0, "fixed_angle": 2.0, "wait_seconds": 60.0},
+    "run_modal": true
+  },
+  "stability": {
+    "cm_alpha_max": -0.01,
+    "cn_beta_min": 0.01,
+    "cl_beta_max": -0.01,
+    "trim_cl_min": 0.05,
+    "static_alpha_range": [-4.0, 4.0],
+    "static_beta_range": [-4.0, 4.0],
+    "modal_real_max": -1e-08,
+    "allow_pilot_correctable": true,
+    "correctable_modes": ["spiral", "phugoid"],
+    "min_time_to_double_seconds": 5.0,
+    "available_controls": ["pitch", "roll", "yaw"],
+    "required_control_axes": ["pitch", "roll", "yaw"],
+    "require_modal": true
+  },
+  "search": {
+    "monte_carlo_samples": 12,
+    "elite_count": 2,
+    "local_iterations": 3,
+    "learning_rate": 0.2,
+    "gradient_fraction": 0.04,
+    "convergence_tolerance": 0.0001,
+    "random_seed": 2026,
+    "max_evaluations": 80
+  }
+}

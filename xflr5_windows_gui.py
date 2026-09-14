@@ -288,6 +288,11 @@ _LOCATORS: dict[str, UiaLocator] = {
         titles=("Sequence", "Sequence analysis", "Sequence On", "Sequence Off"),
         auto_ids=("sequence", "sequenceCheckBox", "sequenceButton"),
     ),
+    "store_oppoint_toggle": UiaLocator(
+        "CheckBox",
+        titles=("Store OpPoint", "Store Operating Point", "Store Op Point"),
+        auto_ids=("storeOpPoint", "storeOpp", "storeWOpp"),
+    ),
     "start_analysis": UiaLocator(
         "Button",
         titles=("Start Analysis", "Analyze", "Start", "Run Analysis"),
@@ -303,10 +308,35 @@ _LOCATORS: dict[str, UiaLocator] = {
         titles=("Fixed angle", "Fixed Angle", "Angle", "Alpha"),
         auto_ids=("fixedAngle", "fixedAngleEdit", "alphaEdit"),
     ),
+    "alpha_edit": UiaLocator(
+        "Edit",
+        titles=("Alpha", "alpha", "α"),
+        auto_ids=("alpha", "alphaEdit"),
+    ),
+    "beta_edit": UiaLocator(
+        "Edit",
+        titles=("Beta", "beta", "β"),
+        auto_ids=("beta", "betaEdit"),
+    ),
     "analysis_name_edit": UiaLocator(
         "Edit",
         titles=("Analysis name", "Analysis Name", "Name", "Polar name", "Polar Name"),
         auto_ids=("analysisName", "analysisNameEdit", "polarNameEdit"),
+    ),
+    "auto_analysis_name": UiaLocator(
+        "CheckBox",
+        titles=("Auto Analysis Name",),
+        auto_ids=("autoAnalysisName", "autoName"),
+    ),
+    "type_1_radio": UiaLocator(
+        "RadioButton",
+        titles=("Type 1 (Fixed Speed)",),
+        auto_ids=("type1", "type1Radio"),
+    ),
+    "type_5_radio": UiaLocator(
+        "RadioButton",
+        titles=("Type 5 (Beta range)",),
+        auto_ids=("type5", "type5Radio"),
     ),
     "sweep_start_edit": UiaLocator(
         "Edit",
@@ -325,12 +355,17 @@ _LOCATORS: dict[str, UiaLocator] = {
     ),
     "export_results": UiaLocator(
         "MenuItem",
-        titles=("Export Results", "Export result", "Export Polar Results"),
+        titles=("Export results", "Export Results", "Export result", "Export Polar Results"),
         auto_ids=("exportResults", "exportResultsMenuItem"),
+    ),
+    "export_oppoint": UiaLocator(
+        "MenuItem",
+        titles=("Export", "Export OpPoint", "Export Operating Point"),
+        auto_ids=("exportOpPoint", "exportCurrentOpPoint"),
     ),
     "delete_polars": UiaLocator(
         "MenuItem",
-        titles=("Delete Polars", "Delete polars", "Delete Polar"),
+        titles=("Delete Associated Polars", "Delete Polars", "Delete polars", "Delete Polar"),
         auto_ids=("deletePolars", "deletePolarsMenuItem"),
     ),
 }
@@ -352,7 +387,7 @@ class WindowsXFLRGui:
     # XFLR5 opens a modal native/Qt file dialog after the triggering action.
     # The legacy adapter gives that dialog a short fixed opportunity to open
     # and relies on its default focus being in the filename field.
-    _FILE_DIALOG_OPEN_DELAY = 0.5
+    _FILE_DIALOG_OPEN_DELAY = 0.1
 
     def __init__(
         self,
@@ -474,7 +509,8 @@ class WindowsXFLRGui:
         if not executable.is_file():
             raise FileNotFoundError(executable)
         try:
-            self._app = Application(backend="uia").start(str(executable))
+            command_line = subprocess.list2cmdline([str(executable)])
+            self._app = Application(backend="uia").start(command_line)
             main_spec = self._app.window(title_re=self._WINDOW_TITLE_RE)
             main_spec.wait("visible enabled ready", timeout=timeout_value)
             self._main = main_spec.wrapper_object()
@@ -747,15 +783,21 @@ class WindowsXFLRGui:
             return ""
 
     def _complete_file_dialog(self, filepath: str | Path, _action: str = "open") -> None:
-        """Enter a path into the already-focused XFLR5 file dialog.
-
-        XFLR5's dialog is assumed to focus its filename field when it opens,
-        matching the legacy adapter's behavior. No UIA dialog discovery is
-        attempted because some XFLR5/Qt builds expose the dialog without a
-        usable filename control tree.
-        """
+        """Enter a path through UIA, with the Qt focused-field fallback."""
 
         time.sleep(self._FILE_DIALOG_OPEN_DELAY)
+        try:
+            filename = self._control_any_window(
+                _LOCATORS["file_name_edit"],
+                "file-dialog filename field",
+                timeout=0.3,
+            )
+        except Exception:
+            filename = None
+        if filename is not None:
+            self._set_text(filename, str(filepath), "file-dialog filename")
+            self._send_keys("{ENTER}", filename)
+            return
         self._send_keys(str(filepath))
         self._send_keys("{ENTER}")
 
@@ -820,6 +862,90 @@ class WindowsXFLRGui:
             self._send_keys("{SPACE}", control)
         self.sequence_on = True
 
+    def _enable_operating_point_storage(self) -> None:
+        """Ensure tree operating points exist for completeness/modal checks."""
+
+        try:
+            control = self._control(
+                self._main,
+                _LOCATORS["store_oppoint_toggle"],
+                "Store OpPoint toggle",
+                timeout=3.0,
+            )
+        except _UiaAmbiguousError:
+            raise
+        except XFLRGuiError:
+            control = self._control(
+                self._main,
+                UiaLocator("Button", titles=_LOCATORS["store_oppoint_toggle"].titles),
+                "Store OpPoint toggle",
+                timeout=3.0,
+            )
+        self._set_toggle(control, True, "Store OpPoint toggle")
+
+    def _wait_for_analysis_finished(self, start_button: Any, timeout: float) -> None:
+        """Wait for XFLR's Analyze control to be re-enabled by onTaskFinished()."""
+
+        # Give Qt time to enter the analysis slot. A very short calculation may
+        # already be complete at the end of this interval, which is also valid.
+        time.sleep(0.05)
+
+        def finished() -> Any | None:
+            checker = getattr(start_button, "is_enabled", None)
+            if not callable(checker):
+                raise XFLRGuiError("The Analyze button does not expose an enabled state through UI Automation.")
+            try:
+                return start_button if checker() else None
+            except Exception:
+                return None
+
+        self._wait_for(finished, "XFLR5 analysis completion", timeout)
+
+    @staticmethod
+    def _toggle_state(control: Any) -> bool | None:
+        for method_name in ("get_toggle_state", "get_check_state"):
+            method = getattr(control, method_name, None)
+            if callable(method):
+                try:
+                    state = method()
+                    return state in (1, True, "1", "on", "On", "checked", "Checked")
+                except Exception:
+                    continue
+        return None
+
+    def _set_toggle(self, control: Any, desired: bool, description: str) -> None:
+        state = self._toggle_state(control)
+        if state is desired:
+            return
+        toggle = getattr(control, "toggle", None)
+        try:
+            if callable(toggle):
+                toggle()
+            else:
+                raise NoPatternInterfaceError()
+        except Exception:
+            self._send_keys("{SPACE}", control)
+        verified = self._toggle_state(control)
+        if verified is not None and verified is not desired:
+            raise XFLRGuiError(f"Could not set {description} to {desired}.")
+
+    def _select_radio(self, parent: Any, locator: UiaLocator, description: str) -> None:
+        control = self._control(parent, locator, description)
+        state = self._toggle_state(control)
+        if state is True:
+            return
+        try:
+            selector = getattr(control, "select", None)
+            if callable(selector):
+                selector()
+            else:
+                self._send_keys("{SPACE}", control)
+        except Exception:
+            self._send_keys("{SPACE}", control)
+        verified = self._toggle_state(control)
+        if verified is False:
+            raise XFLRGuiError(f"Could not select {description}.")
+
     def dump_uia_tree(self, parent: Any | None = None, max_depth: int = 8) -> list[dict[str, Any]]:
         """Return an inspectable semantic UIA tree for locator configuration.
 
@@ -862,6 +988,18 @@ class WindowsXFLRGui:
         # completed by the legacy-style focused-field sequence below.
         self._send_keys("^o", self._main)
         self._complete_file_dialog(filepath, "open")
+        time.sleep(0.05)
+
+        def ready() -> Any | None:
+            checker = getattr(self._main, "is_enabled", None)
+            if not callable(checker):
+                return self._main
+            try:
+                return self._main if checker() else None
+            except Exception:
+                return None
+
+        self._wait_for(ready, f"project load for {filepath}", self._startup_timeout)
 
     def enter_filename(self, filename: str | Path) -> None:
         # Reuse the legacy-style focused-field path for every XFLR5 file
@@ -1056,23 +1194,46 @@ class WindowsXFLRGui:
         PlaneXmlEditor.replace_airfoils(xml_path, left_airfoil, right_airfoil, sections)
         self.replace_part_from_xml(plane, xml_path, part)
 
-    def _configure_analysis_dialog(self, name: str, speed: float, fixed_angle: float) -> Any:
+    def _configure_analysis_dialog(
+        self,
+        name: str,
+        speed: float,
+        fixed_angle: float,
+        sweep_kind: str = "alpha",
+    ) -> Any:
+        kind = sweep_kind.strip().lower()
+        if kind not in {"alpha", "beta"}:
+            raise ValueError(f"Sweep kind must be alpha or beta, got {sweep_kind!r}.")
         self._send_keys("{F6}", self._main)
         dialog = self._wait_secondary_window("analysis settings dialog")
-        speed_control = self._analysis_edit(dialog, "speed_edit", "analysis speed", 0)
-        angle_control = self._analysis_edit(dialog, "fixed_angle_edit", "fixed angle", 1)
-        name_control = self._analysis_edit(dialog, "analysis_name_edit", "analysis name", 2)
+        self._select_radio(
+            dialog,
+            _LOCATORS["type_1_radio" if kind == "alpha" else "type_5_radio"],
+            f"{kind}-sweep polar type",
+        )
+        # Qt creates the name QLineEdit first, then QInf/alpha/beta DoubleEdit
+        # controls in that order. Exact accessible names are preferred; these
+        # indices are the deterministic fallback for upstream XFLR5 v6.62.
+        name_control = self._analysis_edit(dialog, "analysis_name_edit", "analysis name", 0)
+        speed_control = self._analysis_edit(dialog, "speed_edit", "analysis speed", 1)
+        fixed_fallback = 3 if kind == "alpha" else 2
+        angle_control = self._analysis_edit(
+            dialog,
+            "beta_edit" if kind == "alpha" else "alpha_edit",
+            f"fixed {'beta' if kind == 'alpha' else 'alpha'}",
+            fixed_fallback,
+        )
+        try:
+            auto_name = self._control(dialog, _LOCATORS["auto_analysis_name"], "automatic analysis-name toggle", timeout=1.0)
+        except XFLRGuiError:
+            auto_name = None
+        if auto_name is not None:
+            self._set_toggle(auto_name, False, "automatic analysis-name toggle")
         self._set_text(speed_control, str(speed), "analysis speed")
         self._set_text(angle_control, str(fixed_angle), "fixed angle")
         self._set_text(name_control, name, "analysis name")
-        try:
-            ok = self._control(dialog, _LOCATORS["ok_button"], "analysis settings confirmation", timeout=1.0)
-        except XFLRGuiError:
-            ok = None
-        if ok is not None:
-            self._invoke(ok, "analysis settings confirmation")
-        else:
-            self._send_keys("{ENTER}", dialog)
+        save = self._control(dialog, _LOCATORS["save_button"], "analysis settings Save button")
+        self._invoke(save, "analysis settings Save button")
         return dialog
 
     def _sweep_edits(self) -> tuple[Any, Any, Any]:
@@ -1093,6 +1254,33 @@ class WindowsXFLRGui:
             items = self._descendants(plane_item, control_type="ListItem")
         return items
 
+    def _operating_point_items(self, analysis_item: Any) -> list[Any]:
+        items = self._descendants(analysis_item, control_type="TreeItem")
+        if not items:
+            items = self._descendants(analysis_item, control_type="ListItem")
+        return items
+
+    def _expand_analysis(self, analysis_item: Any) -> None:
+        expander = getattr(analysis_item, "expand", None)
+        if callable(expander):
+            try:
+                expander()
+                return
+            except Exception:
+                pass
+        self._send_keys("{RIGHT}", analysis_item)
+
+    def _wait_for_analysis_data(self, name: str, plane: WindowsPlaneRef, timeout: float) -> tuple[Any, list[Any]]:
+        def locate() -> tuple[Any, list[Any]] | None:
+            analysis_item = self.find_analysis(name, plane)
+            if analysis_item is None:
+                return None
+            self._expand_analysis(analysis_item)
+            operating_points = self._operating_point_items(analysis_item)
+            return (analysis_item, operating_points) if operating_points else None
+
+        return self._wait_for(locate, f"completed analysis data for {name!r}", timeout)
+
     def find_analysis(
         self,
         name: str,
@@ -1107,8 +1295,8 @@ class WindowsXFLRGui:
     def _wait_for_analysis(self, name: str, plane: WindowsPlaneRef, timeout: float) -> Any:
         return self._wait_for(lambda: self.find_analysis(name, plane), f"analysis {name!r}", timeout)
 
-    def _invoke_context_item(self, locator: UiaLocator, description: str) -> None:
-        self._send_keys("+{F10}", self._main)
+    def _invoke_context_item(self, locator: UiaLocator, description: str, target: Any | None = None) -> None:
+        self._send_keys("+{F10}", target or self._main)
         item = self._control_any_window(locator, description)
         self._invoke(item, description)
 
@@ -1123,29 +1311,103 @@ class WindowsXFLRGui:
         sweep_increment: float = 0.5,
         fixed_angle: float = 0.0,
         wait_seconds: float = 20.0,
+        sweep_kind: str = "alpha",
     ) -> None:
         self._select_plane(plane)
-        self._configure_analysis_dialog(name, speed, fixed_angle)
+        self._configure_analysis_dialog(name, speed, fixed_angle, sweep_kind)
         self._toggle_sequence()
+        self._enable_operating_point_storage()
         start, end, increment = self._sweep_edits()
         self._set_text(start, str(sweep_start), "sweep start")
         self._set_text(end, str(sweep_end), "sweep end")
         self._set_text(increment, str(sweep_increment), "sweep increment")
         start_button = self._control(self._main, _LOCATORS["start_analysis"], "start-analysis button")
         self._invoke(start_button, "start-analysis button")
-        analysis_item = self._wait_for_analysis(name, plane, wait_seconds)
+        self._wait_for_analysis_finished(start_button, wait_seconds)
+        analysis_item, _ = self._wait_for_analysis_data(name, plane, wait_seconds)
         self._select_tree_item(analysis_item, f"analysis {name!r}")
-        self._invoke_context_item(_LOCATORS["export_results"], "export-results menu item")
+        self._invoke_context_item(_LOCATORS["export_results"], "export-results menu item", analysis_item)
         self._complete_file_dialog(results_out, "save")
         self._wait_for(lambda: Path(results_out).is_file() or None, f"analysis result {results_out}", wait_seconds)
+        self.reset_to_plane_level()
+
+    def _configure_stability_dialog(self, name: str) -> None:
+        self._send_keys("+{F6}", self._main)
+        dialog = self._wait_secondary_window("stability analysis settings dialog")
+        name_control = self._analysis_edit(dialog, "analysis_name_edit", "stability analysis name", 0)
+        try:
+            auto_name = self._control(dialog, _LOCATORS["auto_analysis_name"], "automatic analysis-name toggle", timeout=1.0)
+        except XFLRGuiError:
+            auto_name = None
+        if auto_name is not None:
+            self._set_toggle(auto_name, False, "automatic analysis-name toggle")
+        self._set_text(name_control, name, "stability analysis name")
+        save = self._control(dialog, _LOCATORS["save_button"], "stability analysis Save button")
+        self._invoke(save, "stability analysis Save button")
+
+    @staticmethod
+    def _control_value_from_name(value: str) -> float | None:
+        import re
+
+        number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+        stripped = value.strip()
+        if re.fullmatch(number, stripped):
+            return float(stripped)
+        match = re.search(rf"(?i)(?:ctrl|control(?:\s+value)?)\s*=\s*({number})", value)
+        return float(match.group(1)) if match else None
+
+    def stability_analysis(
+        self,
+        plane: WindowsPlaneRef,
+        name: str,
+        results_out: str | Path,
+        control_start: float = -1.0,
+        control_end: float = 1.0,
+        control_increment: float = 1.0,
+        wait_seconds: float = 60.0,
+    ) -> None:
+        """Run a Type-7 control sequence and export one modal op point as TXT."""
+
+        if control_end <= control_start or control_increment <= 0:
+            raise ValueError("Stability control range must be increasing with a positive increment.")
+        destination = Path(results_out)
+        if destination.suffix.casefold() != ".txt":
+            raise ValueError("Modal operating-point results must use a .txt extension.")
+        self._select_plane(plane)
+        self._configure_stability_dialog(name)
+        self._toggle_sequence()
+        self._enable_operating_point_storage()
+        start, end, increment = self._sweep_edits()
+        self._set_text(start, str(control_start), "stability control start")
+        self._set_text(end, str(control_end), "stability control end")
+        self._set_text(increment, str(control_increment), "stability control increment")
+        start_button = self._control(self._main, _LOCATORS["start_analysis"], "start-analysis button")
+        self._invoke(start_button, "start-analysis button")
+        self._wait_for_analysis_finished(start_button, wait_seconds)
+        analysis_item, operating_points = self._wait_for_analysis_data(name, plane, wait_seconds)
+        control_points = [
+            (item, value)
+            for item in operating_points
+            if (value := self._control_value_from_name(self._control_name(item))) is not None
+        ]
+        if not control_points:
+            raise XFLRGuiError(f"Stability analysis {name!r} produced no selectable control operating points.")
+        selected = min(
+            control_points,
+            key=lambda pair: abs(pair[1]),
+        )[0]
+        self._select_tree_item(selected, f"stability operating point for {name!r}")
+        self._invoke_context_item(_LOCATORS["export_oppoint"], "export operating-point menu item", selected)
+        self._complete_file_dialog(destination, "save")
+        self._wait_for(lambda: destination.is_file() or None, f"modal result {destination}", wait_seconds)
         self.reset_to_plane_level()
 
     def check_plane_name(self, plane: WindowsPlaneRef) -> str:
         return plane.name
 
     def delete_polars(self, plane: WindowsPlaneRef) -> None:
-        self._select_plane(plane)
-        self._invoke_context_item(_LOCATORS["delete_polars"], "delete-polars menu item")
+        plane_item = self._select_plane(plane)
+        self._invoke_context_item(_LOCATORS["delete_polars"], "delete-polars menu item", plane_item)
         try:
             confirmation = self._control_any_window(_LOCATORS["yes_button"], "delete-polars confirmation", 5.0)
         except XFLRGuiError:

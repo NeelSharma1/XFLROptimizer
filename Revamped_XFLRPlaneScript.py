@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from xflr5_core import (
     ConstraintError,
@@ -30,6 +31,29 @@ from xflr5_core import (
 )
 from xflr5_legacy_gui import XFLRGui, xflmacroscript
 from xflr5_windows_gui import UiaLocator, WindowsPlaneRef, WindowsXFLRGui
+from xflr5_optimization import (
+    AnalysisPlan,
+    AnalyticDemoBackend,
+    DesignVariable,
+    GuiXFLRAnalysisBackend,
+    HybridAircraftOptimizer,
+    HybridSearchSettings,
+    ObjectiveSpec,
+    SweepDefinition,
+    console_progress,
+)
+from xflr5_results import (
+    MetricContext,
+    ModalAnalysis,
+    ModalMode,
+    StabilityAssessment,
+    StabilityCriteria,
+    assess_stability,
+    metric_requires_modal,
+    metric_values,
+    parse_modal_report,
+    parse_result_table as _parse_xflr_result_table,
+)
 
 
 @dataclass(frozen=True)
@@ -126,44 +150,27 @@ def _safe_name(value: str) -> str:
 def parse_result_table(result_file: str | Path) -> list[dict[str, float]]:
     """Read the common CSV or whitespace result tables exported by XFLR5."""
 
-    lines = [line.strip() for line in Path(result_file).read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-    for index, line in enumerate(lines[:-1]):
-        delimiter = next((value for value in (",", ";", "\t") if value in line), None)
-        headers = [value.strip() for value in (line.split(delimiter) if delimiter else line.split())]
-        if not headers or not any(re.search(r"[A-Za-z]", header) for header in headers):
-            continue
-        rows: list[dict[str, float]] = []
-        for row_line in lines[index + 1 :]:
-            values = [value.strip() for value in (row_line.split(delimiter) if delimiter else row_line.split())]
-            if len(values) != len(headers):
-                if rows:
-                    break
-                continue
-            try:
-                rows.append({header: float(value) for header, value in zip(headers, values)})
-            except ValueError:
-                if rows:
-                    break
-        if rows:
-            return rows
-    raise ValueError(f"Could not find a numeric result table in {result_file}.")
+    return _parse_xflr_result_table(result_file)
 
 
 def score_result(result_file: str | Path, metric: str = "CL/CD", maximize: bool = True) -> float:
     """Score a result file by the best row for a column or ratio such as ``CL/CD``."""
 
     rows = parse_result_table(result_file)
-    normalized_metric = metric.strip().lower().replace(" ", "")
+    requested = metric.strip().replace(" ", "")
     values: list[float] = []
     for row in rows:
-        normalized = {key.lower().replace(" ", ""): value for key, value in row.items()}
-        if normalized_metric in normalized:
-            values.append(normalized[normalized_metric])
+        if requested in row:
+            values.append(row[requested])
             continue
-        if "/" in normalized_metric:
-            numerator, denominator = normalized_metric.split("/", maxsplit=1)
-            if numerator in normalized and denominator in normalized and normalized[denominator] != 0:
-                values.append(normalized[numerator] / normalized[denominator])
+        if "/" in requested:
+            numerator, denominator = requested.split("/", maxsplit=1)
+            if numerator in row and denominator in row and row[denominator] != 0:
+                values.append(row[numerator] / row[denominator])
+                continue
+        matches = [value for key, value in row.items() if key.casefold() == requested.casefold()]
+        if len(matches) == 1:
+            values.append(matches[0])
     if not values:
         raise ValueError(f"Metric {metric!r} was not present in {result_file}.")
     return max(values) if maximize else min(values)
@@ -694,7 +701,39 @@ def _interactive_settings() -> dict[str, object] | None:
 
 
 def _parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the constrained XFLR5 aircraft optimizer.")
+    parser = argparse.ArgumentParser(
+        description="Run the hybrid Monte Carlo/gradient XFLR5 aircraft optimizer."
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="JSON optimization configuration. Paths inside it are relative to the configuration file.",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run the deterministic no-XFLR demo and generate the same complete output package.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Override the output directory in the JSON configuration or demo defaults.",
+    )
+    parser.add_argument(
+        "--test-results",
+        type=Path,
+        help="Optional JSON test summary to embed in the final report.",
+    )
+    parser.add_argument(
+        "--validate-config",
+        action="store_true",
+        help="Validate and print the JSON optimizer settings without running XFLR5.",
+    )
+    parser.add_argument(
+        "--legacy-interactive",
+        action="store_true",
+        help="Use the original one-metric interactive/grid-search workflow.",
+    )
     parser.add_argument(
         "--gui-backend",
         choices=("auto", "windows", "legacy"),
@@ -707,6 +746,402 @@ def _parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Optional Windows xflr5.exe path to launch when no running XFLR5 process is found.",
     )
     return parser.parse_args(argv)
+
+
+_HYBRID_CONFIG_KEYS = {
+    "backend",
+    "output",
+    "project",
+    "foil_directory",
+    "baseline_component",
+    "part",
+    "plane_index",
+    "sections",
+    "gui_backend",
+    "xflr5_executable",
+    "variables",
+    "objectives",
+    "analysis",
+    "stability",
+    "search",
+    "span_limit",
+    "air_density",
+    "reference_area_m2",
+    "clear_polars_between_designs",
+}
+
+
+def default_demo_configuration() -> dict[str, object]:
+    """Return a useful, deterministic full-pipeline configuration."""
+
+    return {
+        "backend": "demo",
+        "output": "optimization_output",
+        "variables": [
+            {"name": "span", "minimum": 44.0, "maximum": 72.0, "initial": 60.0},
+            {"name": "chord_scale", "minimum": 0.75, "maximum": 1.25, "initial": 1.0},
+            {"name": "sweep_deg", "minimum": 0.0, "maximum": 35.0, "initial": 18.0},
+            {"name": "tip_twist_deg", "minimum": -6.0, "maximum": 2.0, "initial": -2.0},
+            {"name": "dihedral_deg", "minimum": 0.0, "maximum": 8.0, "initial": 4.0},
+            {
+                "name": "airfoil",
+                "choices": ["N22", "NACA 2412", "NACA 23012"],
+                "initial": "N22",
+            },
+        ],
+        "objectives": [
+            {
+                "metric": "CL/CD",
+                "goal": "maximize",
+                "weight": 2.0,
+                "scale": 30.0,
+                "sweep": "alpha",
+                "reducer": "max",
+                "conditions": {"alpha": [-2.0, 10.0]},
+                "label": "peak_efficiency",
+            },
+            {
+                "metric": "Lift",
+                "goal": "target",
+                "target": 1800.0,
+                "weight": 1.2,
+                "scale": 500.0,
+                "sweep": "alpha",
+                "reducer": "max",
+                "conditions": {"alpha": [0.0, 8.0]},
+                "label": "lift_target_N",
+            },
+            {
+                "metric": "Drag",
+                "goal": "minimize",
+                "weight": 0.8,
+                "scale": 100.0,
+                "sweep": "alpha",
+                "reducer": "mean",
+                "conditions": {"alpha": [0.0, 8.0]},
+                "label": "mean_drag_N",
+            },
+            {
+                "metric": "Cm alpha",
+                "goal": "target",
+                "target": -0.9,
+                "weight": 1.0,
+                "scale": 0.35,
+                "sweep": "alpha",
+                "reducer": "mean",
+                "conditions": {"alpha": [-4.0, 8.0]},
+                "label": "cm_alpha_per_rad",
+            },
+            {
+                "metric": "Cn beta",
+                "goal": "at_least",
+                "target": 0.18,
+                "weight": 1.0,
+                "scale": 0.18,
+                "sweep": "beta",
+                "reducer": "mean",
+                "hard": True,
+                "label": "directional_stability",
+            },
+        ],
+        "analysis": {
+            "alpha": {"start": -8.0, "end": 12.0, "increment": 1.0, "speed": 70.0, "wait_seconds": 60.0},
+            "beta": {"start": -8.0, "end": 8.0, "increment": 1.0, "speed": 70.0, "fixed_angle": 2.0, "wait_seconds": 60.0},
+            "run_modal": True,
+        },
+        "stability": {
+            "cm_alpha_max": -0.01,
+            "cn_beta_min": 0.01,
+            "cl_beta_max": -0.01,
+            "trim_cl_min": 0.05,
+            "static_alpha_range": [-4.0, 4.0],
+            "static_beta_range": [-4.0, 4.0],
+            "modal_real_max": -1e-08,
+            "allow_pilot_correctable": True,
+            "correctable_modes": ["spiral", "phugoid"],
+            "min_time_to_double_seconds": 5.0,
+            "available_controls": ["pitch", "roll", "yaw"],
+            "required_control_axes": ["pitch", "roll", "yaw"],
+            "require_modal": True,
+        },
+        "search": {
+            "monte_carlo_samples": 12,
+            "elite_count": 2,
+            "local_iterations": 3,
+            "learning_rate": 0.2,
+            "gradient_fraction": 0.04,
+            "convergence_tolerance": 0.0001,
+            "random_seed": 2026,
+            "max_evaluations": 80,
+        },
+    }
+
+
+def _read_hybrid_configuration(config_file: str | Path) -> tuple[dict[str, object], Path]:
+    path = Path(config_file).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid JSON configuration {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("The optimization JSON root must be an object.")
+    unknown = set(payload) - _HYBRID_CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"Unknown JSON configuration option(s): {', '.join(sorted(unknown))}.")
+    return payload, path.parent
+
+
+def _resolved_config_path(value: object, base_directory: Path, *, must_exist: bool = False, directory: bool = False) -> Path:
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = base_directory / path
+    path = path.resolve()
+    if must_exist and not (path.is_dir() if directory else path.is_file()):
+        kind = "directory" if directory else "file"
+        raise ValueError(f"Configured {kind} does not exist: {path}")
+    return path
+
+
+def _strict_config_boolean(payload: Mapping[str, object], name: str, default: bool) -> bool:
+    value = payload.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false.")
+    return value
+
+
+def _stability_criteria_from_dict(payload: Mapping[str, object]) -> StabilityCriteria:
+    allowed = {field.name for field in StabilityCriteria.__dataclass_fields__.values()}
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(f"Unknown stability setting(s): {', '.join(sorted(unknown))}.")
+    values = dict(payload)
+    for name in ("correctable_modes", "available_controls", "required_control_axes"):
+        if name in values:
+            raw = values[name]
+            if not isinstance(raw, (list, tuple)):
+                raise ValueError(f"stability.{name} must be a JSON array.")
+            values[name] = tuple(str(value) for value in raw)
+    for name in ("static_alpha_range", "static_beta_range"):
+        if name in values:
+            raw = values[name]
+            if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+                raise ValueError(f"stability.{name} must be a two-number JSON array.")
+            values[name] = (float(raw[0]), float(raw[1]))
+    numeric_fields = {
+        "cm_alpha_max",
+        "cn_beta_min",
+        "cl_beta_max",
+        "trim_cl_min",
+        "modal_real_max",
+        "min_time_to_double_seconds",
+    }
+    for name in numeric_fields & values.keys():
+        values[name] = float(values[name])
+    for name in ("allow_pilot_correctable", "require_modal"):
+        if name in values and not isinstance(values[name], bool):
+            raise ValueError(f"stability.{name} must be true or false.")
+    return StabilityCriteria(**values)  # type: ignore[arg-type]
+
+
+def _hybrid_parts(payload: Mapping[str, object]) -> tuple[
+    list[DesignVariable], list[ObjectiveSpec], AnalysisPlan, StabilityCriteria, HybridSearchSettings
+]:
+    unknown_root = set(payload) - _HYBRID_CONFIG_KEYS
+    if unknown_root:
+        raise ValueError(f"Unknown JSON configuration option(s): {', '.join(sorted(unknown_root))}.")
+    raw_variables = payload.get("variables")
+    raw_objectives = payload.get("objectives")
+    if not isinstance(raw_variables, list) or not raw_variables or not all(isinstance(value, Mapping) for value in raw_variables):
+        raise ValueError("Configuration 'variables' must be a non-empty JSON array of objects.")
+    if not isinstance(raw_objectives, list) or not raw_objectives or not all(isinstance(value, Mapping) for value in raw_objectives):
+        raise ValueError("Configuration 'objectives' must be a non-empty JSON array of objects.")
+    variables = [DesignVariable.from_dict(value) for value in raw_variables]
+    objectives = [ObjectiveSpec.from_dict(value) for value in raw_objectives]
+    analysis_payload = payload.get("analysis", {}) or {}
+    stability_payload = payload.get("stability", {}) or {}
+    search_payload = payload.get("search", {}) or {}
+    if not all(isinstance(value, Mapping) for value in (analysis_payload, stability_payload, search_payload)):
+        raise ValueError("analysis, stability, and search settings must be JSON objects.")
+    analysis = AnalysisPlan.from_dict(analysis_payload)
+    stability = _stability_criteria_from_dict(stability_payload)
+    search = HybridSearchSettings.from_dict(search_payload)
+    if len({variable.name for variable in variables}) != len(variables):
+        raise ValueError("Design variable names must be unique.")
+    if len({objective.name for objective in objectives}) != len(objectives):
+        raise ValueError("Objective labels/names must be unique.")
+    if stability.require_modal and not analysis.run_modal:
+        raise ValueError("stability.require_modal=true requires analysis.run_modal=true.")
+    if not analysis.run_modal and any(metric_requires_modal(objective.metric) for objective in objectives):
+        raise ValueError("A modal-root objective requires analysis.run_modal=true.")
+    for name, definition, bounds in (
+        ("static_alpha_range", analysis.alpha, stability.static_alpha_range),
+        ("static_beta_range", analysis.beta, stability.static_beta_range),
+    ):
+        covered = [value for value in definition.values() if bounds[0] <= value <= bounds[1]]
+        if len(covered) < 2:
+            raise ValueError(f"stability.{name} must contain at least two requested sweep points.")
+    backend_name = str(payload.get("backend", "xflr")).casefold()
+    if backend_name not in {"demo", "xflr"}:
+        raise ValueError("backend must be 'xflr' or 'demo'.")
+    if "clear_polars_between_designs" in payload:
+        _strict_config_boolean(payload, "clear_polars_between_designs", True)
+    if backend_name == "xflr":
+        unsupported = {
+            variable.name
+            for variable in variables
+            if variable.name not in PlaneXmlEditor.SUPPORTED_GEOMETRY_PARAMETERS
+            and variable.name not in GuiXFLRAnalysisBackend._AIRFOIL_KEYS
+        }
+        if unsupported:
+            raise ValueError(f"Unsupported XFLR design variable(s): {', '.join(sorted(unsupported))}.")
+        invalid_categories = {
+            variable.name
+            for variable in variables
+            if variable.categorical and variable.name not in GuiXFLRAnalysisBackend._AIRFOIL_KEYS
+        }
+        if invalid_categories:
+            raise ValueError(
+                "Only airfoil variables can be categorical in the XFLR XML backend: "
+                f"{', '.join(sorted(invalid_categories))}."
+            )
+        variable_names = {variable.name for variable in variables}
+        incompatible = []
+        if {"chord_scale", "root_chord"}.issubset(variable_names):
+            incompatible.append("chord_scale with root_chord")
+        if {"taper_ratio", "tip_chord"}.issubset(variable_names):
+            incompatible.append("taper_ratio with tip_chord")
+        if "airfoil" in variable_names and {"left_airfoil", "right_airfoil"} & variable_names:
+            incompatible.append("airfoil with left_airfoil/right_airfoil")
+        if incompatible:
+            raise ValueError(
+                "The XFLR design contains redundant/conflicting variable pairs: "
+                f"{'; '.join(incompatible)}."
+            )
+    return variables, objectives, analysis, stability, search
+
+
+def run_hybrid_configuration(
+    payload: Mapping[str, object],
+    *,
+    base_directory: str | Path = ".",
+    output_override: str | Path | None = None,
+    gui_backend_override: str | None = None,
+    executable_override: str | Path | None = None,
+    test_summary: Mapping[str, object] | None = None,
+) -> tuple[object, dict[str, object]]:
+    """Validate, execute, and report one JSON-style hybrid configuration."""
+
+    from xflr5_reporting import generate_output_package
+
+    base = Path(base_directory).expanduser().resolve()
+    variables, objectives, analysis, stability, search = _hybrid_parts(payload)
+    output_value = output_override if output_override is not None else payload.get("output", "optimization_output")
+    output = _resolved_config_path(output_value, base)
+    backend_name = str(payload.get("backend", "xflr")).casefold()
+    output.mkdir(parents=True, exist_ok=True)
+    if backend_name == "demo":
+        backend = AnalyticDemoBackend(output, analysis)
+    elif backend_name == "xflr":
+        if "project" not in payload:
+            raise ValueError("The XFLR backend requires a project path.")
+        project = _resolved_config_path(payload["project"], base, must_exist=True)
+        selected_gui = gui_backend_override or str(payload.get("gui_backend", "auto"))
+        executable_value = executable_override if executable_override is not None else payload.get("xflr5_executable")
+        executable = None
+        if executable_value:
+            executable = _resolved_config_path(executable_value, base, must_exist=True)
+        gui = _make_gui(project, selected_gui, executable)
+        plane_index = int(payload.get("plane_index", 0))
+        plane = gui.plane_coordinates_from_index(plane_index)
+        part = str(payload.get("part", "wing")).casefold()
+        if part not in {"wing", "elevator", "rudder"}:
+            raise ValueError("part must be wing, elevator, or rudder.")
+        if payload.get("baseline_component"):
+            source_baseline = _resolved_config_path(payload["baseline_component"], base, must_exist=True)
+            copied_baseline = output / "baseline_component.xml"
+            if source_baseline.resolve() != copied_baseline.resolve():
+                shutil.copy2(source_baseline, copied_baseline)
+            baseline = copied_baseline
+        else:
+            baseline = output / "baseline_component.xml"
+            baseline.unlink(missing_ok=True)
+            gui.export_wing(plane, baseline, part)
+        foil_directory = None
+        available: set[str] = set()
+        if payload.get("foil_directory"):
+            foil_directory = _resolved_config_path(payload["foil_directory"], base, must_exist=True, directory=True)
+            available = airfoils_in_directory(foil_directory)
+        requested_airfoils = {
+            choice
+            for variable in variables
+            if variable.name in {"airfoil", "left_airfoil", "right_airfoil"}
+            for choice in variable.choices
+        }
+        if available and not requested_airfoils.issubset(available):
+            missing = ", ".join(sorted(requested_airfoils - available))
+            raise ValueError(f"Configured airfoil .dat file(s) were not found: {missing}.")
+        sections_value = payload.get("sections", [1, None])
+        if not isinstance(sections_value, (list, tuple)) or len(sections_value) != 2:
+            raise ValueError("sections must be [one_based_start, inclusive_end_or_null].")
+        sections = (int(sections_value[0]), None if sections_value[1] is None else int(sections_value[1]))
+        if sections[0] < 1 or (sections[1] is not None and sections[1] < sections[0]):
+            raise ValueError("sections must use increasing, one-based inclusive bounds.")
+        air_density = float(payload.get("air_density", 1.225))
+        reference_area = None if payload.get("reference_area_m2") is None else float(payload["reference_area_m2"])
+        span_limit = None if payload.get("span_limit") is None else float(payload["span_limit"])
+        if not math.isfinite(air_density) or air_density <= 0:
+            raise ValueError("air_density must be finite and positive.")
+        if reference_area is not None and (not math.isfinite(reference_area) or reference_area <= 0):
+            raise ValueError("reference_area_m2 must be finite and positive when provided.")
+        if span_limit is not None and (not math.isfinite(span_limit) or span_limit <= 0):
+            raise ValueError("span_limit must be finite and positive when provided.")
+        backend = GuiXFLRAnalysisBackend(
+            gui,
+            plane,
+            baseline,
+            output,
+            analysis,
+            part=part,
+            sections=sections,
+            allowed_airfoils=sorted(requested_airfoils),
+            available_airfoils=sorted(available),
+            span_limit=span_limit,
+            stability_required=stability.require_modal,
+            clear_polars_between_designs=_strict_config_boolean(
+                payload, "clear_polars_between_designs", True
+            ),
+            air_density=air_density,
+            reference_area_m2=reference_area,
+        )
+    else:
+        raise ValueError("backend must be 'xflr' or 'demo'.")
+
+    configuration_snapshot = json.loads(
+        json.dumps(dict(payload), allow_nan=False, default=str)
+    )
+    configuration_snapshot["resolved_output_directory"] = str(output)
+    (output / "configuration_snapshot.json").write_text(
+        json.dumps(configuration_snapshot, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    optimizer = HybridAircraftOptimizer(
+        backend,
+        variables,
+        objectives,
+        output,
+        stability_criteria=stability,
+        settings=search,
+        progress=console_progress,
+    )
+    run = optimizer.optimize()
+    summary = generate_output_package(
+        run,
+        output,
+        configuration=configuration_snapshot,
+        test_summary=test_summary,
+    )
+    return run, summary
 
 
 def _make_gui(
@@ -728,8 +1163,7 @@ def _make_gui(
     raise ValueError(f"Unsupported GUI backend {backend!r}; use auto, windows, or legacy.")
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    args = _parse_cli_args(argv)
+def _run_legacy_interactive(args: argparse.Namespace) -> None:
     settings = _interactive_settings()
     if settings is None:
         return
@@ -780,6 +1214,49 @@ def main(argv: Sequence[str] | None = None) -> None:
     if result.best is None:
         raise SystemExit("No candidate completed successfully; see optimization_results.json for errors.")
     print(f"Best candidate: {result.best.candidate.name} ({settings['metric']} = {result.best.score:g})")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_cli_args(argv)
+    if args.legacy_interactive or (args.config is None and not args.demo):
+        _run_legacy_interactive(args)
+        return
+    if args.demo and args.config is not None:
+        raise SystemExit("Use either --demo or --config, not both.")
+    if args.demo:
+        payload = default_demo_configuration()
+        base_directory = Path(__file__).resolve().parent
+    else:
+        payload, base_directory = _read_hybrid_configuration(args.config)
+    # Parse every typed section before reporting a configuration as valid.
+    _hybrid_parts(payload)
+    if args.validate_config:
+        print(json.dumps(payload, indent=2))
+        return
+    tests: Mapping[str, object] | None = None
+    if args.test_results is not None:
+        if not args.test_results.is_file():
+            raise SystemExit(f"Test-results JSON does not exist: {args.test_results}")
+        loaded_tests = json.loads(args.test_results.read_text(encoding="utf-8"))
+        if not isinstance(loaded_tests, dict):
+            raise SystemExit("Test-results JSON root must be an object.")
+        tests = loaded_tests
+    run, summary = run_hybrid_configuration(
+        payload,
+        base_directory=base_directory,
+        output_override=args.output,
+        gui_backend_override=args.gui_backend,
+        executable_override=args.xflr5_executable,
+        test_summary=tests,
+    )
+    best = run.best
+    output = Path(str(summary["output_directory"]))
+    print(f"\nRun status: {summary['status']}")
+    if best is not None:
+        print(f"Selected design: {best.evaluation_id}; loss={best.loss:.6g}; feasible={best.feasible}")
+    print(f"Complete report: {(output / 'REPORT.html').resolve()}")
+    if summary["status"] != "PASS":
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

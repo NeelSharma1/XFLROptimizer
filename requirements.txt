@@ -4,3 +4,4 @@ Pillow>=9.3.0
 pyperclip==1.11.0
 opencv-python==4.13.0.90
 pywinauto==0.6.9; sys_platform == "win32"
+matplotlib>=3.7,<4

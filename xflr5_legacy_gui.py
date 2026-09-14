@@ -177,11 +177,23 @@ class XFLRGui:
         sweep_increment: float = 0.5,
         fixed_angle: float = 0.0,
         wait_seconds: float = 20.0,
+        sweep_kind: str = "alpha",
     ) -> None:
+        kind = sweep_kind.strip().lower()
+        if kind not in {"alpha", "beta"}:
+            raise ValueError(f"Sweep kind must be alpha or beta, got {sweep_kind!r}.")
         self.click(plane)
         pg.press("f6")
+        # XFLR focuses and selects QInf when the dialog opens. Type 5 is the
+        # immediately preceding enabled control in the upstream v6 dialog.
+        if kind == "beta":
+            pg.hotkey("shift", "tab")
+            pg.press("space")
+            pg.press("tab")
+        pg.hotkey("ctrl", "a")
         pg.write(str(speed))
         pg.press("tab")
+        pg.hotkey("ctrl", "a")
         pg.write(str(fixed_angle))
         pg.press("tab")
         pg.press("space")
@@ -209,6 +221,25 @@ class XFLRGui:
         self.find_and_click("expRes.png")
         self.enter_filename(results_out)
         self.reset_to_plane_level()
+
+    def stability_analysis(
+        self,
+        plane: Sequence[float],
+        name: str,
+        results_out: str | Path,
+        control_start: float = -1.0,
+        control_end: float = 1.0,
+        control_increment: float = 1.0,
+        wait_seconds: float = 60.0,
+    ) -> None:
+        """Explain the unsupported image-adapter modal workflow explicitly."""
+
+        raise XFLRGuiError(
+            "Automated Type-7 modal export requires the Windows UI Automation backend. "
+            "On macOS/Linux, run with analysis.run_modal=false or export the stability "
+            "operating-point TXT manually; the optimizer will not claim dynamic stability "
+            "without that report."
+        )
 
     def copy_paste(self) -> str:
         pg.hotkey("ctrl", "c")

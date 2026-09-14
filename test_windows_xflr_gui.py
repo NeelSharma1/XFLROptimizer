@@ -5,7 +5,7 @@ from unittest.mock import Mock, call, patch
 
 import Revamped_XFLRPlaneScript as application
 from xflr5_core import XFLRGuiError
-from xflr5_windows_gui import NoPatternInterfaceError, UiaLocator, WindowsPlaneRef, WindowsXFLRGui
+from xflr5_windows_gui import NoPatternInterfaceError, UiaLocator, WindowsPlaneRef, WindowsXFLRGui, _LOCATORS
 
 
 class FakeElementInfo:
@@ -23,6 +23,7 @@ class FakeControl:
         self.invoked = False
         self.text = None
         self.focused = False
+        self.enabled = True
 
     def invoke(self):
         self.invoked = True
@@ -35,6 +36,9 @@ class FakeControl:
 
     def set_focus(self):
         self.focused = True
+
+    def is_enabled(self):
+        return self.enabled
 
 
 class SelectionPatternMissingControl(FakeControl):
@@ -100,6 +104,9 @@ class FakeWindow:
 
     def set_focus(self):
         self.focused = True
+
+    def is_enabled(self):
+        return True
 
 
 class FakeDesktop:
@@ -270,6 +277,7 @@ class WindowsUiAutomationTests(unittest.TestCase):
         main_window = FakeWindow(1234, "Project")
         adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
         adapter._main = main_window
+        adapter._startup_timeout = 1.0
 
         with patch.object(adapter, "_send_keys") as send_keys, patch.object(
             adapter, "_complete_file_dialog"
@@ -290,6 +298,18 @@ class WindowsUiAutomationTests(unittest.TestCase):
             send_keys.call_args_list,
             [call("C:/work/project.xfl"), call("{ENTER}")],
         )
+
+    def test_file_dialog_prefers_the_native_filename_control_when_available(self):
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        filename = FakeControl("1148", title="File name:", control_type="Edit")
+
+        with patch("xflr5_windows_gui.time.sleep"), patch.object(
+            adapter, "_control_any_window", return_value=filename
+        ), patch.object(adapter, "_send_keys") as send_keys:
+            adapter._complete_file_dialog(Path("C:/work/project.xfl"), "open")
+
+        self.assertEqual(filename.text, "C:/work/project.xfl")
+        send_keys.assert_called_once_with("{ENTER}", filename)
 
     def test_plane_selection_falls_back_to_focus_when_selection_pattern_is_missing(self):
         item = SelectionPatternMissingControl("plane", title="Plane 1", control_type="TreeItem")
@@ -313,6 +333,85 @@ class WindowsUiAutomationTests(unittest.TestCase):
 
         send_keys.assert_called_once_with("{SPACE}", control)
         self.assertTrue(adapter.sequence_on)
+
+    def test_analysis_completion_waits_for_analyze_button_to_be_reenabled(self):
+        button = FakeControl("analyze", title="Analyze")
+        button.is_enabled = Mock(side_effect=[False, False, True])
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._startup_timeout = 1.0
+
+        with patch("xflr5_windows_gui.time.sleep"):
+            adapter._wait_for_analysis_finished(button, 1.0)
+
+        self.assertEqual(button.is_enabled.call_count, 3)
+
+    def test_beta_dialog_selects_type_five_and_sets_fixed_alpha(self):
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = FakeWindow(1234, "Project")
+        dialog = object()
+        name = FakeControl("name", control_type="Edit")
+        speed = FakeControl("speed", control_type="Edit")
+        angle = FakeControl("alpha", control_type="Edit")
+        save = FakeControl("save", title="Save")
+
+        def locate(_parent, _locator, description, timeout=10.0):
+            if "automatic" in description:
+                raise XFLRGuiError("not exposed")
+            return save
+
+        with patch.object(adapter, "_send_keys") as send_keys, patch.object(
+            adapter, "_wait_secondary_window", return_value=dialog
+        ), patch.object(adapter, "_select_radio") as select_radio, patch.object(
+            adapter, "_analysis_edit", side_effect=[name, speed, angle]
+        ) as analysis_edit, patch.object(adapter, "_control", side_effect=locate):
+            adapter._configure_analysis_dialog("beta-run", 70.0, 2.0, "beta")
+
+        send_keys.assert_called_once_with("{F6}", adapter._main)
+        select_radio.assert_called_once_with(dialog, _LOCATORS["type_5_radio"], "beta-sweep polar type")
+        self.assertEqual(analysis_edit.call_args_list[2].args[1], "alpha_edit")
+        self.assertEqual((name.text, speed.text, angle.text), ("beta-run", "70.0", "2.0"))
+        self.assertTrue(save.invoked)
+
+    def test_stability_control_point_parser_accepts_xflr_bare_tree_names(self):
+        self.assertEqual(WindowsXFLRGui._control_value_from_name("  -1.250 "), -1.25)
+        self.assertEqual(WindowsXFLRGui._control_value_from_name("Control value = 0.500"), 0.5)
+        self.assertIsNone(WindowsXFLRGui._control_value_from_name("Mode 1"))
+
+    def test_stability_export_selects_control_point_nearest_zero(self):
+        adapter = WindowsXFLRGui.__new__(WindowsXFLRGui)
+        adapter._main = FakeWindow(1234, "Project")
+        plane = WindowsPlaneRef(0, "Plane 1")
+        start_button = FakeControl("start", title="Analyze")
+        edits = tuple(FakeControl(str(index), control_type="Edit") for index in range(3))
+        points = [
+            FakeControl("minus", title=" -1.000 ", control_type="TreeItem"),
+            FakeControl("mode", title="Mode 1", control_type="TreeItem"),
+            FakeControl("zero", title="  0.000 ", control_type="TreeItem"),
+            FakeControl("plus", title="  1.000 ", control_type="TreeItem"),
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "modal.txt"
+
+            def save_file(path, _mode):
+                Path(path).write_text("modal", encoding="utf-8")
+
+            with patch.object(adapter, "_select_plane"), patch.object(
+                adapter, "_configure_stability_dialog"
+            ), patch.object(adapter, "_toggle_sequence"), patch.object(
+                adapter, "_enable_operating_point_storage"
+            ), patch.object(adapter, "_sweep_edits", return_value=edits), patch.object(
+                adapter, "_control", return_value=start_button
+            ), patch.object(adapter, "_wait_for_analysis_finished"), patch.object(
+                adapter, "_wait_for_analysis_data", return_value=(object(), points)
+            ), patch.object(adapter, "_select_tree_item") as select_tree, patch.object(
+                adapter, "_invoke_context_item"
+            ), patch.object(adapter, "_complete_file_dialog", side_effect=save_file), patch.object(
+                adapter, "_wait_for", return_value=True
+            ), patch.object(adapter, "reset_to_plane_level"):
+                adapter.stability_analysis(plane, "stability", destination)
+
+        select_tree.assert_called_once_with(points[2], "stability operating point for 'stability'")
 
     def test_component_editor_is_found_when_other_control_is_inside_main_ui(self):
         other = FakeControl("other", title="Other...", control_type="Button")
