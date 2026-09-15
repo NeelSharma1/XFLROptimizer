@@ -183,7 +183,9 @@ class XFLRGui:
         if kind not in {"alpha", "beta"}:
             raise ValueError(f"Sweep kind must be alpha or beta, got {sweep_kind!r}.")
         self.click(plane)
-        pg.press("f6")
+        # On macOS, XFLR5 exposes the analysis settings dialog through the
+        # hardware function-key combination rather than the media-key action.
+        pg.hotkey("fn", "f6")
         # XFLR focuses and selects QInf when the dialog opens. Type 5 is the
         # immediately preceding enabled control in the upstream v6 dialog.
         if kind == "beta":
