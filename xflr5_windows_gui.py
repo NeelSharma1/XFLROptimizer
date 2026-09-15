@@ -1204,7 +1204,10 @@ class WindowsXFLRGui:
         kind = sweep_kind.strip().lower()
         if kind not in {"alpha", "beta"}:
             raise ValueError(f"Sweep kind must be alpha or beta, got {sweep_kind!r}.")
-        self._send_keys("{F6}", self._main)
+        # Laptop Fn is handled by firmware and has no Windows virtual-key
+        # code. XFLR5 receives the resulting function key as VK_F6, which is
+        # the software equivalent of pressing Fn+F6 on the physical keyboard.
+        self._send_keys("{VK_F6}", self._main)
         dialog = self._wait_secondary_window("analysis settings dialog")
         self._select_radio(
             dialog,

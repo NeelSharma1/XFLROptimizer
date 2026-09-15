@@ -366,7 +366,7 @@ class WindowsUiAutomationTests(unittest.TestCase):
         ) as analysis_edit, patch.object(adapter, "_control", side_effect=locate):
             adapter._configure_analysis_dialog("beta-run", 70.0, 2.0, "beta")
 
-        send_keys.assert_called_once_with("{F6}", adapter._main)
+        send_keys.assert_called_once_with("{VK_F6}", adapter._main)
         select_radio.assert_called_once_with(dialog, _LOCATORS["type_5_radio"], "beta-sweep polar type")
         self.assertEqual(analysis_edit.call_args_list[2].args[1], "alpha_edit")
         self.assertEqual((name.text, speed.text, angle.text), ("beta-run", "70.0", "2.0"))
