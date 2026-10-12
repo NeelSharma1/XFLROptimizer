@@ -188,7 +188,7 @@ class WindowsUiAutomationTests(unittest.TestCase):
     def test_cli_backend_arguments_have_deterministic_defaults(self):
         args = application._parse_cli_args([])
 
-        self.assertEqual(args.gui_backend, "auto")
+        self.assertIsNone(args.gui_backend)
         self.assertIsNone(args.xflr5_executable)
 
     def test_windows_backend_is_selected_without_constructing_the_legacy_adapter(self):

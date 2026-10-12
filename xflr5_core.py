@@ -160,6 +160,21 @@ class PlaneXmlEditor:
         sections: tuple[int, int | None] = (1, None),
         component_name: str | None = None,
     ) -> None:
+        """Replace both sides, defaulting the right foil to the left foil."""
+
+        cls.update_airfoils(xml_path, left_airfoil, right_airfoil or left_airfoil, sections, component_name)
+
+    @classmethod
+    def update_airfoils(
+        cls,
+        xml_path: str | Path,
+        left_airfoil: str | None = None,
+        right_airfoil: str | None = None,
+        sections: tuple[int, int | None] = (1, None),
+        component_name: str | None = None,
+    ) -> None:
+        """Update specified sides while preserving unspecified section foils."""
+
         tree = ET.parse(xml_path)
         wing = cls._target_wing(tree.getroot(), component_name)
         for section in cls._selected_sections(wing, sections):
@@ -167,8 +182,10 @@ class PlaneXmlEditor:
             right = section.find("Right_Side_FoilName")
             if left is None or right is None:
                 raise ConstraintError("The selected XFLR section has no left/right airfoil fields.")
-            left.text = left_airfoil
-            right.text = right_airfoil or left_airfoil
+            if left_airfoil is not None:
+                left.text = left_airfoil
+            if right_airfoil is not None:
+                right.text = right_airfoil
         ET.indent(tree, space="    ")
         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
 

@@ -2,7 +2,9 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import Revamped_XFLRPlaneScript as application
 from xflr5_core import PlaneXmlEditor
@@ -171,6 +173,61 @@ class GeometryOptimizationTests(unittest.TestCase):
         self.assertEqual(len(bundle.alpha_rows), 5)
         self.assertEqual(len(bundle.beta_rows), 5)
         self.assertEqual(len(bundle.modal.modes), 8)
+
+    def test_gui_backend_edits_only_requested_airfoil_sides_and_sections(self):
+        source = Path(__file__).with_name("Main_Wing.xml")
+        baseline = ET.parse(source).findall(".//Section")
+        analysis = AnalysisPlan(
+            alpha=SweepDefinition("alpha", -2.0, 2.0, 1.0),
+            beta=SweepDefinition("beta", -2.0, 2.0, 1.0),
+        )
+        cases = (
+            ({"right_airfoil": "NACA 2412"}, {"Right": "NACA 2412"}),
+            ({"left_airfoil": "NACA 2412"}, {"Left": "NACA 2412"}),
+            ({"airfoil": "NACA 2412"}, {"Left": "NACA 2412", "Right": "NACA 2412"}),
+            (
+                {"left_airfoil": "NACA 2412", "right_airfoil": "NACA 23012"},
+                {"Left": "NACA 2412", "Right": "NACA 23012"},
+            ),
+            ({}, {}),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            backend = GuiXFLRAnalysisBackend(
+                FakeGuiBackend(), object(), source, temporary_directory, analysis,
+                sections=(2, 3),
+            )
+            for index, (design, expected) in enumerate(cases):
+                with self.subTest(design=design):
+                    bundle = backend.evaluate(design, f"eval_{index}")
+                    edited = ET.parse(bundle.files["design_xml"]).findall(".//Section")
+                    for section_index, (before, after) in enumerate(zip(baseline, edited), 1):
+                        for side in ("Left", "Right"):
+                            tag = f"{side}_Side_FoilName"
+                            foil = expected.get(side, before.findtext(tag)) if 2 <= section_index <= 3 else before.findtext(tag)
+                            self.assertEqual(after.findtext(tag), foil)
+                    self.assertEqual(len(edited), len(baseline))
+
+    def test_gui_backend_cli_override_takes_precedence_only_when_explicit(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory) / "project.xfl"
+            project.write_text("fixture", encoding="utf-8")
+            config = application.default_demo_configuration()
+            config.update(backend="xflr", project=str(project), gui_backend="legacy")
+            # Stop at GUI creation; this verifies selection without touching a live app.
+            for cli_value, expected in ((None, "legacy"), ("windows", "windows"), ("auto", "auto")):
+                argv = ["--config", "fixture.json"]
+                if cli_value is not None:
+                    argv.extend(["--gui-backend", cli_value])
+                args = application._parse_cli_args(argv)
+                with self.subTest(cli_value=cli_value), patch.dict(
+                    "sys.modules", {"xflr5_reporting": Mock()}
+                ), patch.object(application, "_make_gui", side_effect=RuntimeError("GUI boundary")) as make_gui:
+                    with self.assertRaisesRegex(RuntimeError, "GUI boundary"):
+                        application.run_hybrid_configuration(
+                            config, output_override=temporary_directory,
+                            gui_backend_override=args.gui_backend,
+                        )
+                    make_gui.assert_called_once_with(project.resolve(), expected, None)
 
     def test_configuration_rejects_modal_requirement_when_modal_run_is_disabled(self):
         config = application.default_demo_configuration()

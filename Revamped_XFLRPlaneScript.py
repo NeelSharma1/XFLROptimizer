@@ -737,8 +737,9 @@ def _parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gui-backend",
         choices=("auto", "windows", "legacy"),
-        default="auto",
-        help="GUI adapter to use; auto selects UI Automation on Windows and the legacy adapter elsewhere.",
+        default=None,
+        help="Override the configured GUI adapter; otherwise use the configuration or auto. "
+        "Auto selects UI Automation on Windows and the legacy adapter elsewhere.",
     )
     parser.add_argument(
         "--xflr5-executable",
@@ -1170,7 +1171,7 @@ def _run_legacy_interactive(args: argparse.Namespace) -> None:
     airfoils = settings["airfoils"]
     output = Path(settings["output"])
     output.mkdir(parents=True, exist_ok=True)
-    gui = _make_gui(settings["project"], args.gui_backend, args.xflr5_executable)
+    gui = _make_gui(settings["project"], args.gui_backend or "auto", args.xflr5_executable)
     part = settings["part"]
     plane = gui.plane_coordinates_from_index(settings["plane_index"])
     baseline_path = output / "baseline_component.xml"

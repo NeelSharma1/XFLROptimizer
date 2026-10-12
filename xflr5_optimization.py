@@ -779,7 +779,7 @@ class GuiXFLRAnalysisBackend(AnalysisBackend):
     def _airfoils(self, design: Mapping[str, DesignValue]) -> tuple[str | None, str | None]:
         common = design.get("airfoil")
         left = design.get("left_airfoil", common)
-        right = design.get("right_airfoil", left)
+        right = design.get("right_airfoil", common)
         return (None if left is None else str(left), None if right is None else str(right))
 
     def _validate_airfoils(self, left: str | None, right: str | None) -> None:
@@ -803,8 +803,8 @@ class GuiXFLRAnalysisBackend(AnalysisBackend):
         shutil.copy2(self.baseline_component, design_path)
         left, right = self._airfoils(design)
         self._validate_airfoils(left, right)
-        if left is not None:
-            PlaneXmlEditor.replace_airfoils(design_path, left, right, self.sections)
+        if left is not None or right is not None:
+            PlaneXmlEditor.update_airfoils(design_path, left, right, self.sections)
         geometry = {key: float(value) for key, value in design.items() if key not in self._AIRFOIL_KEYS}
         PlaneXmlEditor.apply_geometry(design_path, geometry)
         if self.span_limit is not None and PlaneXmlEditor.span(design_path) > self.span_limit:
